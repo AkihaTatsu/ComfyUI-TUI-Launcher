@@ -1,0 +1,73 @@
+# Dynamic schema for the "Launcher Settings" screen.
+# Same conventions as comfyui_schema.toml:
+#   - String values in `name`, `desc`, `label`, and tab `name` are i18n
+#     KEYS, resolved through `core::i18n::t()` at render time.
+#   - Field `key` is the in-memory config key (e.g. `general.language`,
+#     `network.pypi_mirror`). The setter in general_settings.rs looks it
+#     up to know which Config field to mutate.
+#   - `cli` is intentionally left blank — these are launcher-side settings
+#     and never appear on the ComfyUI command line.
+#
+# Settings live in `launcher_config.toml`; this file is just the layout.
+
+[[tab]]
+name = "menu_general"
+
+[[tab.field]]
+key = "general.language"
+name = "setting_language"
+desc = "setting_language_desc"
+# Special type: options come from `core::i18n::available_locales()` at
+# render time — auto-detected from `assets/i18n/*.toml`. No hard-coded
+# locale list anywhere.
+type = "language_choice"
+cli = ""
+default = "en-US"
+
+[[tab.field]]
+key = "network.pypi_mirror"
+name = "setting_pypi_mirror"
+desc = "setting_pypi_mirror_desc"
+type = "custom"
+cli = ""
+default = ""
+
+[[tab.field]]
+key = "network.git_mirror"
+name = "setting_git_mirror"
+desc = "setting_git_mirror_desc"
+type = "custom"
+cli = ""
+default = ""
+
+[[tab.field]]
+key = "network.hf_mirror"
+name = "setting_hf_mirror"
+desc = "setting_hf_mirror_desc"
+type = "custom"
+cli = ""
+default = ""
+
+[[tab.field]]
+key = "network.github_accel"
+name = "setting_github_accel"
+desc = "setting_github_accel_desc"
+type = "custom"
+cli = ""
+default = ""
+
+[[tab.field]]
+key = "general.comfyui_dir"
+name = "setting_comfy_dir"
+desc = "setting_comfy_dir_desc"
+type = "custom"
+cli = ""
+default = ""
+
+[[tab.field]]
+key = "general.python"
+name = "setting_python"
+desc = "setting_python_desc"
+type = "custom"
+cli = ""
+default = ""

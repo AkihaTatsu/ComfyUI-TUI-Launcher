@@ -1,0 +1,740 @@
+# Dynamic schema for the "ComfyUI Settings" screen.
+# Top-level [[tab]] entries become sub-tabs. Each [[tab.field]] becomes a row.
+# Field types: "toggle", "choice", "custom".
+#
+# String VALUES in `name`, `desc`, `label`, and tab `name` are i18n KEYS,
+# not display text — resolved through `core::i18n::t()` at render time.
+# Adding a new field: pick a key like `cs_<field_key>` and add the same
+# key to every locale in `assets/i18n/*.toml` with the localised text.
+#
+# Rendering rules:
+#   - A field is emitted to ComfyUI's command line only when its current value
+#     differs from `default`.
+#   - For "choice" fields with multiple mutually-exclusive flags, set
+#     `default = ""` and let each option's `value` be the flag suffix; the
+#     template `--{value}` expands to the actual flag.
+#   - For "toggle" fields, `default = false` and `cli` is the bare flag.
+#   - For "custom" fields, `default = ""` and `cli` substitutes `{value}`.
+#
+# Flag set mirrors comfy/cli_args.py as of ComfyUI 0.22+.
+
+# ─── Performance ────────────────────────────────────────────────────────────
+[[tab]]
+name = "cs_tab_performance"
+
+[[tab.field]]
+key = "gpu"
+name = "cs_gpu"
+desc = "cs_gpu_desc"
+type = "gpu_choice"
+cli = ""
+default = ""
+
+[[tab.field]]
+key = "vram"
+name = "cs_vram"
+desc = "cs_vram_desc"
+type = "choice"
+cli = "--{value}"
+default = ""
+[[tab.field.option]]
+value = ""
+label = "cs_vram_default"
+[[tab.field.option]]
+value = "highvram"
+label = "cs_vram_highvram"
+[[tab.field.option]]
+value = "lowvram"
+label = "cs_vram_lowvram"
+[[tab.field.option]]
+value = "novram"
+label = "cs_vram_novram"
+[[tab.field.option]]
+value = "cpu"
+label = "cs_vram_cpu"
+
+[[tab.field]]
+key = "gpu_only"
+name = "cs_gpu_only"
+desc = "cs_gpu_only_desc"
+type = "toggle"
+cli = "--gpu-only"
+default = false
+
+[[tab.field]]
+key = "reserve_vram"
+name = "cs_reserve_vram"
+desc = "cs_reserve_vram_desc"
+type = "custom"
+cli = "--reserve-vram {value}"
+default = ""
+
+[[tab.field]]
+key = "disable_smart_memory"
+name = "cs_disable_smart_memory"
+desc = "cs_disable_smart_memory_desc"
+type = "toggle"
+cli = "--disable-smart-memory"
+default = false
+
+[[tab.field]]
+key = "enable_dynamic_vram"
+name = "cs_enable_dynamic_vram"
+desc = "cs_enable_dynamic_vram_desc"
+type = "toggle"
+cli = "--enable-dynamic-vram"
+default = false
+
+[[tab.field]]
+key = "disable_dynamic_vram"
+name = "cs_disable_dynamic_vram"
+desc = "cs_disable_dynamic_vram_desc"
+type = "toggle"
+cli = "--disable-dynamic-vram"
+default = false
+
+[[tab.field]]
+key = "async_offload"
+name = "cs_async_offload"
+desc = "cs_async_offload_desc"
+type = "custom"
+cli = "--async-offload {value}"
+default = ""
+
+[[tab.field]]
+key = "disable_async_offload"
+name = "cs_disable_async_offload"
+desc = "cs_disable_async_offload_desc"
+type = "toggle"
+cli = "--disable-async-offload"
+default = false
+
+[[tab.field]]
+key = "force_channels_last"
+name = "cs_force_channels_last"
+desc = "cs_force_channels_last_desc"
+type = "toggle"
+cli = "--force-channels-last"
+default = false
+
+[[tab.field]]
+key = "mmap_torch_files"
+name = "cs_mmap_torch_files"
+desc = "cs_mmap_torch_files_desc"
+type = "toggle"
+cli = "--mmap-torch-files"
+default = false
+
+[[tab.field]]
+key = "disable_mmap"
+name = "cs_disable_mmap"
+desc = "cs_disable_mmap_desc"
+type = "toggle"
+cli = "--disable-mmap"
+default = false
+
+[[tab.field]]
+key = "disable_pinned_memory"
+name = "cs_disable_pinned_memory"
+desc = "cs_disable_pinned_memory_desc"
+type = "toggle"
+cli = "--disable-pinned-memory"
+default = false
+
+[[tab.field]]
+key = "fast"
+name = "cs_fast"
+desc = "cs_fast_desc"
+type = "toggle"
+cli = "--fast"
+default = false
+
+# ─── Precision ──────────────────────────────────────────────────────────────
+[[tab]]
+name = "cs_tab_precision"
+
+[[tab.field]]
+key = "force_precision"
+name = "cs_force_precision"
+desc = "cs_force_precision_desc"
+type = "choice"
+cli = "--{value}"
+default = ""
+[[tab.field.option]]
+value = ""
+label = "cs_force_precision_default"
+[[tab.field.option]]
+value = "force-fp16"
+label = "cs_force_precision_fp16"
+[[tab.field.option]]
+value = "force-fp32"
+label = "cs_force_precision_fp32"
+
+[[tab.field]]
+key = "unet_precision"
+name = "cs_unet_precision"
+desc = "cs_unet_precision_desc"
+type = "choice"
+cli = "--{value}"
+default = ""
+[[tab.field.option]]
+value = ""
+label = "cs_unet_precision_default"
+[[tab.field.option]]
+value = "fp32-unet"
+label = "cs_unet_precision_fp32"
+[[tab.field.option]]
+value = "bf16-unet"
+label = "cs_unet_precision_bf16"
+[[tab.field.option]]
+value = "fp16-unet"
+label = "cs_unet_precision_fp16"
+[[tab.field.option]]
+value = "fp8_e4m3fn-unet"
+label = "cs_unet_precision_fp8_e4m3fn"
+[[tab.field.option]]
+value = "fp8_e5m2-unet"
+label = "cs_unet_precision_fp8_e5m2"
+[[tab.field.option]]
+value = "fp8_e8m0fnu-unet"
+label = "cs_unet_precision_fp8_e8m0fnu"
+[[tab.field.option]]
+value = "fp64-unet"
+label = "cs_unet_precision_fp64"
+
+[[tab.field]]
+key = "vae_precision"
+name = "cs_vae_precision"
+desc = "cs_vae_precision_desc"
+type = "choice"
+cli = "--{value}"
+default = ""
+[[tab.field.option]]
+value = ""
+label = "cs_vae_precision_default"
+[[tab.field.option]]
+value = "fp16-vae"
+label = "cs_vae_precision_fp16"
+[[tab.field.option]]
+value = "fp32-vae"
+label = "cs_vae_precision_fp32"
+[[tab.field.option]]
+value = "bf16-vae"
+label = "cs_vae_precision_bf16"
+
+[[tab.field]]
+key = "cpu_vae"
+name = "cs_cpu_vae"
+desc = "cs_cpu_vae_desc"
+type = "toggle"
+cli = "--cpu-vae"
+default = false
+
+[[tab.field]]
+key = "text_encoder_precision"
+name = "cs_text_encoder_precision"
+desc = "cs_text_encoder_precision_desc"
+type = "choice"
+cli = "--{value}"
+default = ""
+[[tab.field.option]]
+value = ""
+label = "cs_text_encoder_precision_default"
+[[tab.field.option]]
+value = "fp16-text-enc"
+label = "cs_text_encoder_precision_fp16"
+[[tab.field.option]]
+value = "fp32-text-enc"
+label = "cs_text_encoder_precision_fp32"
+[[tab.field.option]]
+value = "bf16-text-enc"
+label = "cs_text_encoder_precision_bf16"
+[[tab.field.option]]
+value = "fp8_e4m3fn-text-enc"
+label = "cs_text_encoder_precision_fp8_e4m3fn"
+[[tab.field.option]]
+value = "fp8_e5m2-text-enc"
+label = "cs_text_encoder_precision_fp8_e5m2"
+
+[[tab.field]]
+key = "fp16_intermediates"
+name = "cs_fp16_intermediates"
+desc = "cs_fp16_intermediates_desc"
+type = "toggle"
+cli = "--fp16-intermediates"
+default = false
+
+[[tab.field]]
+key = "supports_fp8_compute"
+name = "cs_supports_fp8_compute"
+desc = "cs_supports_fp8_compute_desc"
+type = "toggle"
+cli = "--supports-fp8-compute"
+default = false
+
+# ─── Attention ──────────────────────────────────────────────────────────────
+[[tab]]
+name = "cs_tab_attention"
+
+[[tab.field]]
+key = "cross_attention"
+name = "cs_cross_attention"
+desc = "cs_cross_attention_desc"
+type = "choice"
+cli = "--{value}"
+default = ""
+[[tab.field.option]]
+value = ""
+label = "cs_cross_attention_default"
+[[tab.field.option]]
+value = "use-pytorch-cross-attention"
+label = "cs_cross_attention_pytorch"
+[[tab.field.option]]
+value = "use-split-cross-attention"
+label = "cs_cross_attention_split"
+[[tab.field.option]]
+value = "use-quad-cross-attention"
+label = "cs_cross_attention_quad"
+[[tab.field.option]]
+value = "use-sage-attention"
+label = "cs_cross_attention_sage"
+[[tab.field.option]]
+value = "use-flash-attention"
+label = "cs_cross_attention_flash"
+
+[[tab.field]]
+key = "disable_xformers"
+name = "cs_disable_xformers"
+desc = "cs_disable_xformers_desc"
+type = "toggle"
+cli = "--disable-xformers"
+default = false
+
+[[tab.field]]
+key = "upcast_attention"
+name = "cs_upcast_attention"
+desc = "cs_upcast_attention_desc"
+type = "choice"
+cli = "--{value}"
+default = ""
+[[tab.field.option]]
+value = ""
+label = "cs_upcast_attention_default"
+[[tab.field.option]]
+value = "force-upcast-attention"
+label = "cs_upcast_attention_force"
+[[tab.field.option]]
+value = "dont-upcast-attention"
+label = "cs_upcast_attention_dont"
+
+# ─── Cache ──────────────────────────────────────────────────────────────────
+[[tab]]
+name = "cs_tab_cache"
+
+[[tab.field]]
+key = "cache_strategy"
+name = "cs_cache_strategy"
+desc = "cs_cache_strategy_desc"
+type = "choice"
+cli = "--{value}"
+default = ""
+[[tab.field.option]]
+value = ""
+label = "cs_cache_strategy_default"
+[[tab.field.option]]
+value = "cache-classic"
+label = "cs_cache_strategy_classic"
+[[tab.field.option]]
+value = "cache-none"
+label = "cs_cache_strategy_none"
+
+[[tab.field]]
+key = "cache_lru"
+name = "cs_cache_lru"
+desc = "cs_cache_lru_desc"
+type = "custom"
+cli = "--cache-lru {value}"
+default = ""
+
+[[tab.field]]
+key = "cache_ram"
+name = "cs_cache_ram"
+desc = "cs_cache_ram_desc"
+type = "custom"
+cli = "--cache-ram {value}"
+default = ""
+
+# ─── Network ────────────────────────────────────────────────────────────────
+[[tab]]
+name = "cs_tab_network"
+
+[[tab.field]]
+key = "listen"
+name = "cs_listen"
+desc = "cs_listen_desc"
+type = "custom"
+cli = "--listen {value}"
+default = ""
+
+[[tab.field]]
+key = "port"
+name = "cs_port"
+desc = "cs_port_desc"
+type = "custom"
+cli = "--port {value}"
+default = ""
+
+[[tab.field]]
+key = "cors_origin"
+name = "cs_cors_origin"
+desc = "cs_cors_origin_desc"
+type = "custom"
+cli = "--enable-cors-header {value}"
+default = ""
+
+[[tab.field]]
+key = "max_upload_size"
+name = "cs_max_upload_size"
+desc = "cs_max_upload_size_desc"
+type = "custom"
+cli = "--max-upload-size {value}"
+default = ""
+
+[[tab.field]]
+key = "tls_keyfile"
+name = "cs_tls_keyfile"
+desc = "cs_tls_keyfile_desc"
+type = "custom"
+cli = "--tls-keyfile {value}"
+default = ""
+
+[[tab.field]]
+key = "tls_certfile"
+name = "cs_tls_certfile"
+desc = "cs_tls_certfile_desc"
+type = "custom"
+cli = "--tls-certfile {value}"
+default = ""
+
+[[tab.field]]
+key = "auto_launch"
+name = "cs_auto_launch"
+desc = "cs_auto_launch_desc"
+type = "toggle"
+cli = "--auto-launch"
+default = false
+
+[[tab.field]]
+key = "disable_auto_launch"
+name = "cs_disable_auto_launch"
+desc = "cs_disable_auto_launch_desc"
+type = "toggle"
+cli = "--disable-auto-launch"
+default = false
+
+[[tab.field]]
+key = "enable_compress_response_body"
+name = "cs_enable_compress_response_body"
+desc = "cs_enable_compress_response_body_desc"
+type = "toggle"
+cli = "--enable-compress-response-body"
+default = false
+
+[[tab.field]]
+key = "multi_user"
+name = "cs_multi_user"
+desc = "cs_multi_user_desc"
+type = "toggle"
+cli = "--multi-user"
+default = false
+
+# ─── Custom Nodes & UI ──────────────────────────────────────────────────────
+[[tab]]
+name = "cs_tab_custom_nodes_ui"
+
+[[tab.field]]
+key = "disable_all_custom_nodes"
+name = "cs_disable_all_custom_nodes"
+desc = "cs_disable_all_custom_nodes_desc"
+type = "toggle"
+cli = "--disable-all-custom-nodes"
+default = false
+
+[[tab.field]]
+key = "whitelist_custom_nodes"
+name = "cs_whitelist_custom_nodes"
+desc = "cs_whitelist_custom_nodes_desc"
+type = "custom"
+cli = "--whitelist-custom-nodes {value}"
+default = ""
+
+[[tab.field]]
+key = "disable_api_nodes"
+name = "cs_disable_api_nodes"
+desc = "cs_disable_api_nodes_desc"
+type = "toggle"
+cli = "--disable-api-nodes"
+default = false
+
+[[tab.field]]
+key = "enable_manager"
+name = "cs_enable_manager"
+desc = "cs_enable_manager_desc"
+type = "toggle"
+cli = "--enable-manager"
+default = false
+
+[[tab.field]]
+key = "disable_manager_ui"
+name = "cs_disable_manager_ui"
+desc = "cs_disable_manager_ui_desc"
+type = "toggle"
+cli = "--disable-manager-ui"
+default = false
+
+[[tab.field]]
+key = "enable_manager_legacy_ui"
+name = "cs_enable_manager_legacy_ui"
+desc = "cs_enable_manager_legacy_ui_desc"
+type = "toggle"
+cli = "--enable-manager-legacy-ui"
+default = false
+
+[[tab.field]]
+key = "preview_method"
+name = "cs_preview_method"
+desc = "cs_preview_method_desc"
+type = "choice"
+cli = "--preview-method {value}"
+default = "none"
+[[tab.field.option]]
+value = "none"
+label = "cs_preview_method_none"
+[[tab.field.option]]
+value = "auto"
+label = "cs_preview_method_auto"
+[[tab.field.option]]
+value = "latent2rgb"
+label = "cs_preview_method_latent2rgb"
+[[tab.field.option]]
+value = "taesd"
+label = "cs_preview_method_taesd"
+
+[[tab.field]]
+key = "preview_size"
+name = "cs_preview_size"
+desc = "cs_preview_size_desc"
+type = "custom"
+cli = "--preview-size {value}"
+default = ""
+
+[[tab.field]]
+key = "disable_metadata"
+name = "cs_disable_metadata"
+desc = "cs_disable_metadata_desc"
+type = "toggle"
+cli = "--disable-metadata"
+default = false
+
+# ─── Paths ──────────────────────────────────────────────────────────────────
+[[tab]]
+name = "cs_tab_paths"
+
+[[tab.field]]
+key = "base_directory"
+name = "cs_base_directory"
+desc = "cs_base_directory_desc"
+type = "custom"
+cli = "--base-directory {value}"
+default = ""
+
+[[tab.field]]
+key = "output_directory"
+name = "cs_output_directory"
+desc = "cs_output_directory_desc"
+type = "custom"
+cli = "--output-directory {value}"
+default = ""
+
+[[tab.field]]
+key = "input_directory"
+name = "cs_input_directory"
+desc = "cs_input_directory_desc"
+type = "custom"
+cli = "--input-directory {value}"
+default = ""
+
+[[tab.field]]
+key = "temp_directory"
+name = "cs_temp_directory"
+desc = "cs_temp_directory_desc"
+type = "custom"
+cli = "--temp-directory {value}"
+default = ""
+
+[[tab.field]]
+key = "user_directory"
+name = "cs_user_directory"
+desc = "cs_user_directory_desc"
+type = "custom"
+cli = "--user-directory {value}"
+default = ""
+
+[[tab.field]]
+key = "extra_model_paths_config"
+name = "cs_extra_model_paths_config"
+desc = "cs_extra_model_paths_config_desc"
+type = "custom"
+cli = "--extra-model-paths-config {value}"
+default = ""
+
+# ─── Logging & Advanced ─────────────────────────────────────────────────────
+[[tab]]
+name = "cs_tab_logging_advanced"
+
+[[tab.field]]
+key = "verbose"
+name = "cs_verbose"
+desc = "cs_verbose_desc"
+type = "choice"
+cli = "--verbose {value}"
+default = "INFO"
+[[tab.field.option]]
+value = "INFO"
+label = "cs_verbose_info"
+[[tab.field.option]]
+value = "DEBUG"
+label = "cs_verbose_debug"
+[[tab.field.option]]
+value = "WARNING"
+label = "cs_verbose_warning"
+[[tab.field.option]]
+value = "ERROR"
+label = "cs_verbose_error"
+[[tab.field.option]]
+value = "CRITICAL"
+label = "cs_verbose_critical"
+
+[[tab.field]]
+key = "log_stdout"
+name = "cs_log_stdout"
+desc = "cs_log_stdout_desc"
+type = "toggle"
+cli = "--log-stdout"
+default = false
+
+[[tab.field]]
+key = "dont_print_server"
+name = "cs_dont_print_server"
+desc = "cs_dont_print_server_desc"
+type = "toggle"
+cli = "--dont-print-server"
+default = false
+
+[[tab.field]]
+key = "deterministic"
+name = "cs_deterministic"
+desc = "cs_deterministic_desc"
+type = "toggle"
+cli = "--deterministic"
+default = false
+
+[[tab.field]]
+key = "cuda_malloc"
+name = "cs_cuda_malloc"
+desc = "cs_cuda_malloc_desc"
+type = "toggle"
+cli = "--cuda-malloc"
+default = false
+
+[[tab.field]]
+key = "disable_cuda_malloc"
+name = "cs_disable_cuda_malloc"
+desc = "cs_disable_cuda_malloc_desc"
+type = "toggle"
+cli = "--disable-cuda-malloc"
+default = false
+
+[[tab.field]]
+key = "default_hashing_function"
+name = "cs_default_hashing_function"
+desc = "cs_default_hashing_function_desc"
+type = "choice"
+cli = "--default-hashing-function {value}"
+default = "sha256"
+[[tab.field.option]]
+value = "sha256"
+label = "cs_default_hashing_function_sha256"
+[[tab.field.option]]
+value = "md5"
+label = "cs_default_hashing_function_md5"
+[[tab.field.option]]
+value = "sha1"
+label = "cs_default_hashing_function_sha1"
+[[tab.field.option]]
+value = "sha512"
+label = "cs_default_hashing_function_sha512"
+
+[[tab.field]]
+key = "front_end_version"
+name = "cs_front_end_version"
+desc = "cs_front_end_version_desc"
+type = "custom"
+cli = "--front-end-version {value}"
+default = ""
+
+[[tab.field]]
+key = "front_end_root"
+name = "cs_front_end_root"
+desc = "cs_front_end_root_desc"
+type = "custom"
+cli = "--front-end-root {value}"
+default = ""
+
+[[tab.field]]
+key = "enable_triton_backend"
+name = "cs_enable_triton_backend"
+desc = "cs_enable_triton_backend_desc"
+type = "toggle"
+cli = "--enable-triton-backend"
+default = false
+
+[[tab.field]]
+key = "enable_assets"
+name = "cs_enable_assets"
+desc = "cs_enable_assets_desc"
+type = "toggle"
+cli = "--enable-assets"
+default = false
+
+[[tab.field]]
+key = "comfy_api_base"
+name = "cs_comfy_api_base"
+desc = "cs_comfy_api_base_desc"
+type = "custom"
+cli = "--comfy-api-base {value}"
+default = ""
+
+[[tab.field]]
+key = "database_url"
+name = "cs_database_url"
+desc = "cs_database_url_desc"
+type = "custom"
+cli = "--database-url {value}"
+default = ""
+
+[[tab.field]]
+key = "force_non_blocking"
+name = "cs_force_non_blocking"
+desc = "cs_force_non_blocking_desc"
+type = "toggle"
+cli = "--force-non-blocking"
+default = false
+
+[[tab.field]]
+key = "extra_args"
+name = "cs_extra_args"
+desc = "cs_extra_args_desc"
+type = "custom"
+cli = "{value}"
+default = ""

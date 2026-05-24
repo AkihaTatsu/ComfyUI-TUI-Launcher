@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux — system
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            features: ""
+            artifact: comfyui-tui-launcher-linux
+            bin: comfyui-tui-launcher
+          # Linux — portable
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            features: portable
+            artifact: comfyui-tui-launcher-linux-portable
+            bin: comfyui-tui-launcher
+          # macOS — system
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            features: ""
+            artifact: comfyui-tui-launcher-macos
+            bin: comfyui-tui-launcher
+          # macOS — portable
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            features: portable
+            artifact: comfyui-tui-launcher-macos-portable
+            bin: comfyui-tui-launcher
+          # Windows — system
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            features: ""
+            artifact: comfyui-tui-launcher-windows.exe
+            bin: comfyui-tui-launcher.exe
+          # Windows — portable
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            features: portable
+            artifact: comfyui-tui-launcher-windows-portable.exe
+            bin: comfyui-tui-launcher.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-${{ matrix.features }}
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.features }}" ]; then
+            cargo build --release --target ${{ matrix.target }} --features ${{ matrix.features }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Rename binary
+        shell: bash
+        run: |
+          mv target/${{ matrix.target }}/release/${{ matrix.bin }} ${{ matrix.artifact }}
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.artifact }}
