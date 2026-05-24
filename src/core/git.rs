@@ -5,6 +5,20 @@
 use crate::core::process::{run_logged, Cmd};
 use std::collections::HashMap;
 
+/// Returns a `Command` for `git` with `safe.directory=*` injected via
+/// environment variables so that repositories on drives without ownership
+/// metadata (common on Windows with exFAT/network drives) don't fail.
+///
+/// This is ephemeral — it only affects processes spawned by the launcher
+/// and never modifies the user's global `.gitconfig`.
+fn git_command() -> Command {
+    let mut cmd = Command::new("git");
+    cmd.env("GIT_CONFIG_COUNT", "1");
+    cmd.env("GIT_CONFIG_KEY_0", "safe.directory");
+    cmd.env("GIT_CONFIG_VALUE_0", "*");
+    cmd
+}
+
 /// Merges non-interactive safeguards into the caller-supplied environment.
 ///
 /// Without these, a `git fetch` against an auth-required remote can hang
@@ -29,6 +43,9 @@ fn no_prompt_env(mut env: HashMap<String, String>) -> HashMap<String, String> {
             "ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new".into(),
         );
     }
+    env.insert("GIT_CONFIG_COUNT".into(), "1".into());
+    env.insert("GIT_CONFIG_KEY_0".into(), "safe.directory".into());
+    env.insert("GIT_CONFIG_VALUE_0".into(), "*".into());
     env
 }
 use anyhow::Result;
@@ -59,7 +76,7 @@ pub fn log_all(repo: &Path, n: usize) -> Result<Vec<Commit>> {
 }
 
 fn log_impl(repo: &Path, n: usize, all: bool) -> Result<Vec<Commit>> {
-    let mut cmd = Command::new("git");
+    let mut cmd = git_command();
     cmd.arg("-C").arg(repo).arg("log").arg(format!("-n{n}"));
     if all {
         cmd.arg("--all");
@@ -95,7 +112,7 @@ fn log_impl(repo: &Path, n: usize, all: bool) -> Result<Vec<Commit>> {
 
 /// Returns the short hash of the current `HEAD`, or `None` on failure.
 pub fn current_commit(repo: &Path) -> Option<String> {
-    let out = Command::new("git")
+    let out = git_command()
         .arg("-C")
         .arg(repo)
         .arg("rev-parse")
@@ -116,7 +133,7 @@ pub fn current_commit(repo: &Path) -> Option<String> {
 /// detached head, which is treated as "no branch" so callers can safely
 /// use `@{u}` only when this returns `Some`.
 pub fn current_branch(repo: &Path) -> Option<String> {
-    let out = Command::new("git")
+    let out = git_command()
         .arg("-C")
         .arg(repo)
         .arg("rev-parse")
@@ -143,7 +160,7 @@ pub fn current_branch(repo: &Path) -> Option<String> {
 /// `HEAD..origin/HEAD` for detached heads, then `HEAD..FETCH_HEAD`.
 pub fn behind_upstream(repo: &Path) -> u32 {
     for target in ["@{u}", "origin/HEAD", "FETCH_HEAD"] {
-        let out = Command::new("git")
+        let out = git_command()
             .arg("-C")
             .arg(repo)
             .arg("rev-list")
@@ -163,7 +180,7 @@ pub fn behind_upstream(repo: &Path) -> u32 {
 
 /// Returns the URL configured for `origin`, or `None` on failure.
 pub fn remote_url(repo: &Path) -> Option<String> {
-    let out = Command::new("git")
+    let out = git_command()
         .arg("-C")
         .arg(repo)
         .arg("config")
@@ -196,7 +213,7 @@ pub fn fetch(repo: &Path, env: std::collections::HashMap<String, String>) -> Res
 /// A shallow clone caps `git log` at the boundary, so listing older
 /// versions requires a deepening fetch first.
 pub fn is_shallow(repo: &Path) -> bool {
-    Command::new("git")
+    git_command()
         .arg("-C")
         .arg(repo)
         .arg("rev-parse")
@@ -352,7 +369,7 @@ fn parse_release_tag(s: &str) -> Option<(u32, u32, u32)> {
 /// Enumerates `v<major>.<minor>.<patch>` release tags in the repository,
 /// descending by version. Annotated tags resolve to their peeled commit.
 pub fn tags_pointing_at_releases(repo: &Path) -> Vec<TagCommit> {
-    let out = match Command::new("git")
+    let out = match git_command()
         .arg("-C")
         .arg(repo)
         .arg("for-each-ref")
@@ -405,7 +422,7 @@ pub fn tags_pointing_at_releases(repo: &Path) -> Vec<TagCommit> {
 }
 
 fn show_short_date_subject(repo: &Path, sha: &str) -> (String, String, String) {
-    let out = Command::new("git")
+    let out = git_command()
         .arg("-C")
         .arg(repo)
         .arg("show")
@@ -429,7 +446,7 @@ fn show_short_date_subject(repo: &Path, sha: &str) -> (String, String, String) {
 /// Returns the release tag name when `HEAD` points exactly at a tag of the
 /// form `v<major>.<minor>.<patch>`.
 pub fn current_release_tag(repo: &Path) -> Option<String> {
-    let out = Command::new("git")
+    let out = git_command()
         .arg("-C")
         .arg(repo)
         .arg("describe")
