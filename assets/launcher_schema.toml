@@ -14,6 +14,22 @@
 name = "menu_general"
 
 [[tab.field]]
+key = "general.comfyui_dir"
+name = "setting_comfy_dir"
+desc = "setting_comfy_dir_desc"
+type = "custom"
+cli = ""
+default = ""
+
+[[tab.field]]
+key = "general.python"
+name = "setting_python"
+desc = "setting_python_desc"
+type = "custom"
+cli = ""
+default = ""
+
+[[tab.field]]
 key = "general.language"
 name = "setting_language"
 desc = "setting_language_desc"
@@ -56,18 +72,38 @@ type = "custom"
 cli = ""
 default = ""
 
-[[tab.field]]
-key = "general.comfyui_dir"
-name = "setting_comfy_dir"
-desc = "setting_comfy_dir_desc"
-type = "custom"
-cli = ""
-default = ""
+# ── Crash auto-restart (launcher-side; see core::process supervisor) ──
+# These never reach the ComfyUI command line. The toggle gates the feature;
+# the three numeric fields only take effect when the toggle is on.
 
 [[tab.field]]
-key = "general.python"
-name = "setting_python"
-desc = "setting_python_desc"
+key = "general.crash_auto_restart"
+name = "setting_crash_auto_restart"
+desc = "setting_crash_auto_restart_desc"
+type = "toggle"
+cli = ""
+default = false
+
+[[tab.field]]
+key = "general.crash_restart_delay_secs"
+name = "setting_crash_restart_delay"
+desc = "setting_crash_restart_delay_desc"
 type = "custom"
 cli = ""
-default = ""
+default = "2"
+
+[[tab.field]]
+key = "general.crash_restart_window_secs"
+name = "setting_crash_restart_window"
+desc = "setting_crash_restart_window_desc"
+type = "custom"
+cli = ""
+default = "60"
+
+[[tab.field]]
+key = "general.crash_restart_max_fails"
+name = "setting_crash_restart_max_fails"
+desc = "setting_crash_restart_max_fails_desc"
+type = "custom"
+cli = ""
+default = "5"

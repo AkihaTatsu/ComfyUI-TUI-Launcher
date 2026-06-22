@@ -124,7 +124,7 @@ dependencies = [
 
 [[package]]
 name = "comfyui-tui-launcher"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arboard",
@@ -138,6 +138,7 @@ dependencies = [
  "toml",
  "unicode-width 0.2.0",
  "ureq",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

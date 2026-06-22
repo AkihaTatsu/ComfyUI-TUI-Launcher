@@ -786,16 +786,29 @@ impl App {
         };
     }
 
-    /// Replaces this process with ComfyUI and exits.
+    /// Launches ComfyUI and exits. With crash auto-restart off this replaces
+    /// the process with ComfyUI (unchanged behaviour); with it on the launcher
+    /// stays alive as a supervisor that relaunches ComfyUI after a crash.
     pub fn do_launch(self) -> ! {
         let args = schema::build_cli_args(&self.schema, &self.cfg.comfy_settings);
         let env = env::build(&self.cfg.network);
+        let python = std::path::Path::new(&self.cfg.general.python);
+        let comfy_dir = std::path::Path::new(&self.cfg.general.comfyui_dir);
+        if self.cfg.general.crash_auto_restart {
+            log_bus::push("launch", format!("supervise python {}", args.join(" ")));
+            process::supervise_comfyui_and_exit(
+                python,
+                comfy_dir,
+                args,
+                env,
+                process::RestartPolicy {
+                    delay_secs: self.cfg.general.crash_restart_delay_secs,
+                    window_secs: self.cfg.general.crash_restart_window_secs,
+                    max_fails: self.cfg.general.crash_restart_max_fails,
+                },
+            );
+        }
         log_bus::push("launch", format!("execvp python {}", args.join(" ")));
-        process::launch_comfyui_and_exit(
-            std::path::Path::new(&self.cfg.general.python),
-            std::path::Path::new(&self.cfg.general.comfyui_dir),
-            args,
-            env,
-        );
+        process::launch_comfyui_and_exit(python, comfy_dir, args, env);
     }
 }

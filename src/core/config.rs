@@ -17,7 +17,7 @@ use toml::Value;
 // `Default` impls so the two stay in sync.
 
 /// General launcher preferences stored in `launcher_config.toml`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct General {
     /// Absolute path to the ComfyUI installation root.
     #[serde(default)]
@@ -31,6 +31,23 @@ pub struct General {
     /// UI mode (`advanced` or `simple`).
     #[serde(default = "default_mode")]
     pub mode: String,
+    /// When enabled, the launcher stays alive as a supervisor and restarts
+    /// ComfyUI after an unexpected crash. See [`crate::core::process`].
+    #[serde(default)]
+    pub crash_auto_restart: bool,
+    /// Seconds to wait before each restart (only used when
+    /// `crash_auto_restart` is on).
+    #[serde(default = "default_restart_delay")]
+    pub crash_restart_delay_secs: u64,
+    /// Sliding window, in seconds, over which crashes are counted for
+    /// crash-loop protection (only used when `crash_auto_restart` is on).
+    #[serde(default = "default_restart_window")]
+    pub crash_restart_window_secs: u64,
+    /// If the number of crashes within `crash_restart_window_secs` exceeds
+    /// this, the supervisor gives up instead of restarting (only used when
+    /// `crash_auto_restart` is on).
+    #[serde(default = "default_restart_max_fails")]
+    pub crash_restart_max_fails: u32,
 }
 // Empty by default. The canonicalisation step in `load_or_init` replaces
 // empty or unknown values with the first available locale so the locale
@@ -40,6 +57,33 @@ fn default_lang() -> String {
 }
 fn default_mode() -> String {
     "advanced".into()
+}
+fn default_restart_delay() -> u64 {
+    2
+}
+fn default_restart_window() -> u64 {
+    60
+}
+fn default_restart_max_fails() -> u32 {
+    5
+}
+
+// Manual `Default` so the numeric crash-restart fields fall back to the same
+// values as their serde `default` fns (a derived `Default` would zero them,
+// which would be written verbatim into a fresh `launcher_config.toml`).
+impl Default for General {
+    fn default() -> Self {
+        Self {
+            comfyui_dir: String::new(),
+            python: String::new(),
+            language: default_lang(),
+            mode: default_mode(),
+            crash_auto_restart: false,
+            crash_restart_delay_secs: default_restart_delay(),
+            crash_restart_window_secs: default_restart_window(),
+            crash_restart_max_fails: default_restart_max_fails(),
+        }
+    }
 }
 
 /// Network mirror, proxy, and acceleration settings stored in

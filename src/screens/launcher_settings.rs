@@ -76,7 +76,28 @@ fn get(cfg: &Config, key: &str) -> Value {
         "network.git_mirror" => Value::String(cfg.network.git_mirror.clone()),
         "network.hf_mirror" => Value::String(cfg.network.hf_mirror.clone()),
         "network.github_accel" => Value::String(cfg.network.github_accel.clone()),
+        "general.crash_auto_restart" => Value::Boolean(cfg.general.crash_auto_restart),
+        "general.crash_restart_delay_secs" => {
+            Value::String(cfg.general.crash_restart_delay_secs.to_string())
+        }
+        "general.crash_restart_window_secs" => {
+            Value::String(cfg.general.crash_restart_window_secs.to_string())
+        }
+        "general.crash_restart_max_fails" => {
+            Value::String(cfg.general.crash_restart_max_fails.to_string())
+        }
         _ => Value::String(String::new()),
+    }
+}
+
+// Parses a non-negative integer settings field, rejecting non-numeric input
+// with a localised error and clamping to `min` so the supervisor never gets a
+// degenerate 0 window / 0 max-fails.
+fn parse_count(v: &Value, min: u64) -> Result<u64, String> {
+    let raw = v.as_str().unwrap_or("").trim();
+    match raw.parse::<u64>() {
+        Ok(n) => Ok(n.max(min)),
+        Err(_) => Err(i18n::t("popup_invalid_number")),
     }
 }
 
@@ -132,6 +153,31 @@ fn set(cfg: &mut Config, key: &str, v: Value) -> Result<(), String> {
         "network.github_accel" => {
             cfg.network.github_accel =
                 crate::core::env::normalize_semicolon_list(v.as_str().unwrap_or(""));
+            let _ = cfg.save();
+            Ok(())
+        }
+        "general.crash_auto_restart" => {
+            if let Some(b) = v.as_bool() {
+                cfg.general.crash_auto_restart = b;
+                let _ = cfg.save();
+            }
+            Ok(())
+        }
+        // Numeric crash-restart parameters. Delay may be 0 (restart at once);
+        // window and max-fails are clamped to at least 1 so the crash-loop
+        // protection always has a meaningful budget.
+        "general.crash_restart_delay_secs" => {
+            cfg.general.crash_restart_delay_secs = parse_count(&v, 0)?;
+            let _ = cfg.save();
+            Ok(())
+        }
+        "general.crash_restart_window_secs" => {
+            cfg.general.crash_restart_window_secs = parse_count(&v, 1)?;
+            let _ = cfg.save();
+            Ok(())
+        }
+        "general.crash_restart_max_fails" => {
+            cfg.general.crash_restart_max_fails = parse_count(&v, 1)? as u32;
             let _ = cfg.save();
             Ok(())
         }
