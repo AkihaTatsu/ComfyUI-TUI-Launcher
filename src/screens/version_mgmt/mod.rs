@@ -11,13 +11,13 @@ pub mod extensions_tab;
 pub mod install_tab;
 
 use crate::core::config::Config;
-use crate::core::{i18n, log_bus, theme};
+use crate::core::{i18n, log_bus, text, theme};
 use crate::widgets::popup;
 use crate::widgets::tabs::Tabs;
 use crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -667,22 +667,12 @@ impl VersionMgmt {
         };
         f.render_widget(block, r);
 
-        // Tail of the log bus for live progress.
+        // Tail of the log bus for live progress. This is pre-wrapped every
+        // frame using the current popup width, so terminal resizes cannot
+        // leave the latest output below the clipped area.
         let snap = log_bus::snapshot();
-        let tail_n = inner.height.saturating_sub(2) as usize;
-        let start = snap.len().saturating_sub(tail_n);
-        let mut lines: Vec<Line> = vec![
-            Line::from(Span::styled(i18n::t("popup_please_wait"), theme::base())),
-            Line::from(""),
-        ];
-        for l in &snap[start..] {
-            lines.push(Line::from(vec![
-                Span::styled(format!("{} ", l.ts), theme::base()),
-                Span::styled(format!("[{}] ", l.source), theme::accent()),
-                Span::raw(l.text.clone()),
-            ]));
-        }
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+        let lines = pending_log_lines(&snap, inner.width, inner.height);
+        f.render_widget(Paragraph::new(lines), inner);
     }
 
     fn split(area: Rect) -> (Rect, Rect) {
@@ -800,6 +790,10 @@ impl VersionMgmt {
         }
         match code {
             KeyCode::Left => {
+                if self.current_tab_popup_open() {
+                    self.dispatch_current_tab_key(code, cfg);
+                    return;
+                }
                 let consumed = match self.tab {
                     0 | 1 => self.core.on_left(),
                     2 => self.ext.on_left(),
@@ -812,6 +806,10 @@ impl VersionMgmt {
                 }
             }
             KeyCode::Right => {
+                if self.current_tab_popup_open() {
+                    self.dispatch_current_tab_key(code, cfg);
+                    return;
+                }
                 let consumed = match self.tab {
                     0 | 1 => self.core.on_right(),
                     2 => self.ext.on_right(),
@@ -824,20 +822,153 @@ impl VersionMgmt {
                 }
             }
             _ => {
-                self.sync_core_filter();
-                let req = match self.tab {
-                    0 | 1 => self.core.on_key(code, cfg),
-                    2 => self.ext.on_key(code, cfg),
-                    3 => {
-                        let items = self.ext.items.clone();
-                        self.install.on_key(code, cfg, &items)
-                    }
-                    _ => None,
-                };
-                if let Some(req) = req {
-                    self.spawn(req);
-                }
+                self.dispatch_current_tab_key(code, cfg);
             }
         }
+    }
+
+    fn current_tab_popup_open(&self) -> bool {
+        match self.tab {
+            2 => {
+                self.ext.notice.is_some()
+                    || self.ext.actions_menu.is_some()
+                    || self.ext.version_picker.is_some()
+                    || self.ext.confirm.is_some()
+            }
+            3 => self.install.notice.is_some() || self.install.actions_menu.is_some(),
+            _ => false,
+        }
+    }
+
+    fn dispatch_current_tab_key(&mut self, code: KeyCode, cfg: &Config) {
+        self.sync_core_filter();
+        let req = match self.tab {
+            0 | 1 => self.core.on_key(code, cfg),
+            2 => self.ext.on_key(code, cfg),
+            3 => {
+                let items = self.ext.items.clone();
+                self.install.on_key(code, cfg, &items)
+            }
+            _ => None,
+        };
+        if let Some(req) = req {
+            self.spawn(req);
+        }
+    }
+}
+
+fn pending_log_lines(snap: &[log_bus::LogLine], width: u16, height: u16) -> Vec<Line<'static>> {
+    let max_lines = height as usize;
+    if max_lines == 0 || width == 0 {
+        return Vec::new();
+    }
+
+    let mut log_lines = Vec::new();
+    for line in snap {
+        log_lines.extend(wrap_log_line(line, width as usize));
+    }
+
+    let show_notice = max_lines >= 3;
+    let log_budget = if show_notice {
+        max_lines.saturating_sub(2)
+    } else {
+        max_lines
+    };
+    let start = log_lines.len().saturating_sub(log_budget);
+
+    let mut lines = Vec::with_capacity(max_lines);
+    if show_notice {
+        lines.push(Line::from(Span::styled(
+            i18n::t("popup_please_wait"),
+            theme::base(),
+        )));
+        lines.push(Line::from(""));
+    }
+    lines.extend(log_lines[start..].iter().cloned());
+    lines
+}
+
+fn wrap_log_line(line: &log_bus::LogLine, width: usize) -> Vec<Line<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
+
+    let prefix = format!("{} [{}] ", line.ts, line.source);
+    let prefix_width = text::width(&prefix);
+
+    if prefix_width >= width {
+        return text::wrap_to_width(&format!("{prefix}{}", line.text), width)
+            .into_iter()
+            .map(Line::from)
+            .collect();
+    }
+
+    let body_width = width - prefix_width;
+    let wrapped = text::wrap_to_width(&line.text, body_width);
+    let indent = " ".repeat(prefix_width);
+
+    wrapped
+        .into_iter()
+        .enumerate()
+        .map(|(idx, part)| {
+            if idx == 0 {
+                Line::from(vec![
+                    Span::styled(format!("{} ", line.ts), theme::base()),
+                    Span::styled(format!("[{}] ", line.source), theme::accent()),
+                    Span::raw(part),
+                ])
+            } else {
+                Line::from(vec![Span::raw(indent.clone()), Span::raw(part)])
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn log(text: &str) -> log_bus::LogLine {
+        log_bus::LogLine {
+            ts: "00:00:00".to_string(),
+            source: "test".to_string(),
+            text: text.to_string(),
+        }
+    }
+
+    fn plain(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn pending_log_lines_keeps_tail_after_wrapping() {
+        let logs = vec![log(
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu",
+        )];
+        let wrapped = wrap_log_line(&logs[0], 28);
+        assert!(wrapped.len() > 3);
+
+        let lines = pending_log_lines(&logs, 28, 5);
+        let got: Vec<String> = lines.iter().skip(2).map(plain).collect();
+        let expected: Vec<String> = wrapped[wrapped.len() - 3..].iter().map(plain).collect();
+
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn tiny_popup_prioritizes_latest_log_lines_over_notice() {
+        let logs = vec![log(
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu",
+        )];
+        let wrapped = wrap_log_line(&logs[0], 28);
+
+        let lines = pending_log_lines(&logs, 28, 2);
+        let got: Vec<String> = lines.iter().map(plain).collect();
+        let expected: Vec<String> = wrapped[wrapped.len() - 2..].iter().map(plain).collect();
+
+        assert_eq!(got, expected);
     }
 }
