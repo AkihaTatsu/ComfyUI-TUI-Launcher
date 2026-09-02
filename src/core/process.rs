@@ -3,10 +3,13 @@
 use crate::core::log_bus;
 use anyhow::Result;
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+const HF_FORCE_MIRROR_WRAPPER: &str = include_str!("../../assets/python/hf_force_mirror.py");
 
 /// Builder for a child process invocation.
 pub struct Cmd {
@@ -49,7 +52,6 @@ impl Cmd {
 /// long-running commands such as `pip install` or `git fetch` so the user
 /// sees progress rather than a single dump at the end.
 pub fn run_logged(source: &str, c: Cmd) -> Result<bool> {
-    use std::io::{BufRead, BufReader};
     use std::thread;
 
     log_bus::push(
@@ -76,18 +78,12 @@ pub fn run_logged(source: &str, c: Cmd) -> Result<bool> {
 
     let h_out = stdout.map(|s| {
         thread::spawn(move || {
-            let reader = BufReader::new(s);
-            for line in reader.lines().map_while(|l| l.ok()) {
-                log_bus::push(&src_o, line);
-            }
+            stream_output(s, &src_o, "stdout", "");
         })
     });
     let h_err = stderr.map(|s| {
         thread::spawn(move || {
-            let reader = BufReader::new(s);
-            for line in reader.lines().map_while(|l| l.ok()) {
-                log_bus::push(&src_e, format!("err: {line}"));
-            }
+            stream_output(s, &src_e, "stderr", "err: ");
         })
     });
 
@@ -100,6 +96,61 @@ pub fn run_logged(source: &str, c: Cmd) -> Result<bool> {
     }
     log_bus::push(source, format!("(exit {})", status.code().unwrap_or(-1)));
     Ok(status.success())
+}
+
+fn stream_output<R: Read>(mut reader: R, source: &str, stream: &str, prefix: &str) {
+    let progress_key = format!("{source}:{stream}");
+    let mut pending = Vec::<u8>::new();
+    let mut had_progress = false;
+    let mut buf = [0u8; 4096];
+
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        for &b in &buf[..n] {
+            match b {
+                b'\r' => {
+                    push_pending_progress(source, &progress_key, prefix, &pending);
+                    pending.clear();
+                    had_progress = true;
+                }
+                b'\n' => {
+                    push_pending_line(source, &progress_key, prefix, &pending, had_progress);
+                    pending.clear();
+                    had_progress = false;
+                }
+                _ => pending.push(b),
+            }
+        }
+    }
+
+    if !pending.is_empty() {
+        push_pending_line(source, &progress_key, prefix, &pending, had_progress);
+    }
+}
+
+fn push_pending_progress(source: &str, key: &str, prefix: &str, pending: &[u8]) {
+    if pending.is_empty() {
+        return;
+    }
+    let text = String::from_utf8_lossy(pending);
+    log_bus::push_progress(source, key, format!("{prefix}{text}"));
+}
+
+fn push_pending_line(source: &str, key: &str, prefix: &str, pending: &[u8], had_progress: bool) {
+    if pending.is_empty() {
+        return;
+    }
+    let text = String::from_utf8_lossy(pending);
+    let text = format!("{prefix}{text}");
+    if had_progress {
+        log_bus::push_progress(source, key, text);
+    } else {
+        log_bus::push(source, text);
+    }
 }
 
 /// Replaces this process with an interactive shell whose environment has
@@ -151,7 +202,8 @@ pub fn activate_env_and_exit(venv_root: &Path) -> ! {
 }
 
 /// Launches ComfyUI by replacing this process (Unix) or by spawning a
-/// console-inheriting child and exiting (Windows).
+/// console-inheriting child and exiting (Windows). The launched process
+/// inherits the launcher's working directory on every platform.
 ///
 /// Does not return on success.
 pub fn launch_comfyui_and_exit(
@@ -161,33 +213,20 @@ pub fn launch_comfyui_and_exit(
     env: HashMap<String, String>,
 ) -> ! {
     let main_py = comfy_dir.join("main.py");
-    let mut full: Vec<String> = vec![main_py.display().to_string()];
-    full.extend(args);
+    let full = comfyui_python_args(&main_py, args, &env);
 
     #[cfg(unix)]
     {
-        use std::ffi::CString;
         use std::os::unix::process::CommandExt;
-        let mut cmd = Command::new(python);
-        cmd.args(&full).current_dir(comfy_dir);
-        for (k, v) in &env {
-            cmd.env(k, v);
-        }
-        // chdir to the ComfyUI directory so relative paths resolve.
-        let _ = std::env::set_current_dir(comfy_dir);
+        let mut cmd = comfyui_command(python, &full, &env);
         let err = cmd.exec();
         eprintln!("exec failed: {err}");
-        let _ = CString::new(""); // silence unused warning on some platforms
         std::process::exit(1);
     }
 
     #[cfg(windows)]
     {
-        let mut cmd = Command::new(python);
-        cmd.args(&full).current_dir(comfy_dir);
-        for (k, v) in &env {
-            cmd.env(k, v);
-        }
+        let mut cmd = comfyui_command(python, &full, &env);
         // Spawn and exit so the child inherits the console on Windows.
         match cmd.spawn() {
             Ok(_) => std::process::exit(0),
@@ -380,9 +419,7 @@ pub fn supervise_comfyui_and_exit(
     use crate::core::i18n;
 
     let main_py = comfy_dir.join("main.py");
-    let mut full: Vec<String> = vec![main_py.display().to_string()];
-    full.extend(args);
-    let _ = std::env::set_current_dir(comfy_dir);
+    let full = comfyui_python_args(&main_py, args, &env);
 
     install_stop_handlers();
     notice(&i18n::t("restart_supervisor_banner"));
@@ -392,12 +429,8 @@ pub fn supervise_comfyui_and_exit(
     let mut crashes: Vec<Duration> = Vec::new();
 
     loop {
-        let mut cmd = Command::new(python);
-        cmd.args(&full).current_dir(comfy_dir);
-        for (k, v) in &env {
-            cmd.env(k, v);
-        }
-        log_bus::push("launch", format!("spawn python {}", full.join(" ")));
+        let mut cmd = comfyui_command(python, &full, &env);
+        log_bus::push("launch", format!("spawn python {}", display_args(&full)));
 
         // A spawn failure is treated like a crash so a transient problem can
         // recover, while a permanent one trips loop protection and gives up.
@@ -468,6 +501,45 @@ pub fn supervise_comfyui_and_exit(
     }
 }
 
+fn comfyui_python_args(
+    main_py: &Path,
+    args: Vec<String>,
+    env: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut full = if env.contains_key(crate::core::env::HF_FORCE_MIRROR_ENV) {
+        vec![
+            "-c".to_string(),
+            HF_FORCE_MIRROR_WRAPPER.to_string(),
+            main_py.display().to_string(),
+        ]
+    } else {
+        vec![main_py.display().to_string()]
+    };
+    full.extend(args);
+    full
+}
+
+/// Builds a ComfyUI process without overriding its working directory. This
+/// keeps direct launch and crash-restart behaviour identical on all platforms.
+fn comfyui_command(python: &Path, args: &[String], env: &HashMap<String, String>) -> Command {
+    let mut cmd = Command::new(python);
+    cmd.args(args);
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    cmd
+}
+
+fn display_args(args: &[String]) -> String {
+    if args.len() >= 2 && args[0] == "-c" && args[1] == HF_FORCE_MIRROR_WRAPPER {
+        let mut out = vec!["-c".to_string(), "<hf-force-mirror-wrapper>".to_string()];
+        out.extend(args[2..].iter().cloned());
+        out.join(" ")
+    } else {
+        args.join(" ")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,5 +603,94 @@ mod tests {
             window,
             5
         ));
+    }
+
+    #[test]
+    fn comfyui_args_are_plain_without_force_mirror() {
+        let got = comfyui_python_args(
+            Path::new("main.py"),
+            vec!["--listen".into(), "0.0.0.0".into()],
+            &HashMap::new(),
+        );
+        assert_eq!(got, vec!["main.py", "--listen", "0.0.0.0"]);
+    }
+
+    #[test]
+    fn comfyui_args_use_wrapper_with_force_mirror() {
+        let mut env = HashMap::new();
+        env.insert(
+            crate::core::env::HF_FORCE_MIRROR_ENV.into(),
+            "https://hf-mirror.com".into(),
+        );
+        let got = comfyui_python_args(Path::new("main.py"), vec!["--listen".into()], &env);
+        assert_eq!(got[0], "-c");
+        assert_eq!(got[1], HF_FORCE_MIRROR_WRAPPER);
+        assert_eq!(got[2], "main.py");
+        assert_eq!(got[3], "--listen");
+    }
+
+    #[test]
+    fn comfyui_command_inherits_the_launchers_working_directory() {
+        let command = comfyui_command(
+            Path::new("/python"),
+            &["/comfy/main.py".into(), "--listen".into()],
+            &HashMap::new(),
+        );
+
+        assert_eq!(command.get_current_dir(), None);
+    }
+
+    #[test]
+    fn display_args_hides_embedded_wrapper() {
+        let got = display_args(&[
+            "-c".into(),
+            HF_FORCE_MIRROR_WRAPPER.into(),
+            "main.py".into(),
+        ]);
+        assert_eq!(got, "-c <hf-force-mirror-wrapper> main.py");
+    }
+
+    #[test]
+    fn carriage_return_progress_replaces_one_log_line() {
+        let source = "progress_replaces_one_log_line";
+        stream_output(
+            std::io::Cursor::new(b"0%\r50%\r100%\n".to_vec()),
+            source,
+            "stderr",
+            "err: ",
+        );
+
+        let snap = crate::core::log_bus::snapshot();
+        let key = format!("{source}:stderr");
+        let got: Vec<_> = snap
+            .iter()
+            .filter(|line| line.progress_key.as_deref() == Some(key.as_str()))
+            .collect();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].source, source);
+        assert_eq!(got[0].text, "err: 100%");
+    }
+
+    #[test]
+    fn normal_newlines_append_log_lines() {
+        let source = "normal_newlines_append_log_lines";
+        stream_output(
+            std::io::Cursor::new(b"a\nb\nc\n".to_vec()),
+            source,
+            "stdout",
+            "",
+        );
+
+        let snap = crate::core::log_bus::snapshot();
+        let got: Vec<&str> = snap
+            .iter()
+            .filter(|line| line.source == source)
+            .map(|line| line.text.as_str())
+            .collect();
+        assert_eq!(got, vec!["a", "b", "c"]);
+        assert!(snap
+            .iter()
+            .filter(|line| line.source == source)
+            .all(|line| line.progress_key.is_none()));
     }
 }

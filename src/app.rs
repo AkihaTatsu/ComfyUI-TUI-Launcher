@@ -20,6 +20,28 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 use std::cell::Cell;
 
+/// Below this size the full application layout is suspended. Rendering a
+/// compact fallback keeps popup geometry and fixed-width panes away from
+/// zero-sized rectangles while the user is dragging a terminal window down
+/// to its minimum.
+pub const MIN_VIEWPORT_WIDTH: u16 = 40;
+pub const MIN_VIEWPORT_HEIGHT: u16 = 8;
+
+/// Whether the terminal currently has enough cells for the full layout.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum ViewportMode {
+    Ready,
+    TooSmall,
+}
+
+fn viewport_mode(width: u16, height: u16) -> ViewportMode {
+    if width >= MIN_VIEWPORT_WIDTH && height >= MIN_VIEWPORT_HEIGHT {
+        ViewportMode::Ready
+    } else {
+        ViewportMode::TooSmall
+    }
+}
+
 /// Builds Zellij-style key-hint lines, wrapping to additional rows when
 /// the terminal is too narrow to fit the strip on one line.
 ///
@@ -116,6 +138,9 @@ pub struct App {
     body_inner: Cell<Rect>,
     /// Cached menu rectangle from the last render.
     menu_rect: Cell<Rect>,
+    /// Guards input hit-testing and full-layout rendering while the terminal
+    /// is too small to represent the application's fixed panes safely.
+    viewport_mode: Cell<ViewportMode>,
     /// Timestamp of the most recently consumed wheel-scroll event.
     ///
     /// Used to coalesce the burst of events that a single physical wheel
@@ -193,6 +218,7 @@ impl App {
             focus_menu: true,
             body_inner: Cell::new(Rect::default()),
             menu_rect: Cell::new(Rect::default()),
+            viewport_mode: Cell::new(ViewportMode::Ready),
             // Seed in the past so the first real wheel event passes the
             // coalescing window.
             last_scroll: Cell::new(std::time::Instant::now() - std::time::Duration::from_secs(1)),
@@ -237,7 +263,8 @@ impl App {
     /// channels, drains screen-level flash messages into the banner
     /// slots, and expires the transient banner when its three-second
     /// window elapses.
-    pub fn tick(&mut self) {
+    pub fn tick(&mut self) -> bool {
+        let mut changed = false;
         // Swap the i18n catalogue when the user picks a different
         // language. This is the single language-change detector in the
         // application.
@@ -247,13 +274,21 @@ impl App {
                 std::io::stdout(),
                 crossterm::terminal::SetTitle(i18n::t("app_title"))
             );
+            changed = true;
         }
-        self.version.tick(&self.cfg);
+        changed |= self.version.tick(&self.cfg);
+        if self.version.take_repo_changed() {
+            self.main.invalidate_info();
+        }
+        changed |= self
+            .main
+            .tick(&self.cfg, &self.schema, self.screen == Screen::Main);
         // Poll the Button widget's deferred-fire pipeline on the main
         // screen.
         let act = self.main.poll_button_action(&self.cfg);
         if !matches!(act, crate::screens::main_launcher::MainAction::None) {
             self.apply_main_action(act);
+            changed = true;
         }
         // Drain one-shot screen flashes into the transient banner slot.
         if let Some((k, m)) = self.version.take_flash() {
@@ -261,6 +296,7 @@ impl App {
                 FlashKind::Info => self.set_flash(m),
                 FlashKind::Error => self.set_flash_error(m),
             }
+            changed = true;
         }
         // Mirror background-refresh progress into the permanent banner
         // slot; it clears automatically when the refresh finishes.
@@ -271,6 +307,7 @@ impl App {
         self.logs.tick();
         if let Some(t) = &mut self.tutorial {
             t.tick(&mut self.cfg);
+            changed = true;
             if t.is_done() {
                 self.tutorial = None;
             }
@@ -279,13 +316,30 @@ impl App {
         if let Some((_, _, exp)) = &self.flash_temp {
             if *exp < std::time::Instant::now() {
                 self.flash_temp = None;
+                changed = true;
             }
         }
+        changed
     }
 
     /// Renders the current frame.
     pub fn draw(&self, f: &mut Frame) {
         let area = f.area();
+        self.set_viewport_size(area.width, area.height);
+        if self.viewport_mode.get() == ViewportMode::TooSmall {
+            let message = if area.width >= 12 && area.height > 0 {
+                format!(" {} ", i18n::t("viewport_too_small"))
+            } else {
+                String::new()
+            };
+            f.render_widget(
+                Paragraph::new(message)
+                    .style(theme::accent())
+                    .alignment(ratatui::layout::Alignment::Center),
+                area,
+            );
+            return;
+        }
         // Compute wrapped hint lines first so the status row gets exactly
         // the height it needs, and the body shrinks correspondingly.
         let hints = self.key_hints();
@@ -368,9 +422,7 @@ impl App {
             self.body_inner.set(inner);
             let body_active = !self.focus_menu;
             match self.screen {
-                Screen::Main => self
-                    .main
-                    .render(f, inner, &self.cfg, &self.schema, body_active),
+                Screen::Main => self.main.render(f, inner, body_active),
                 Screen::ComfySettings => {
                     self.comfy
                         .render(f, inner, &self.schema, &self.cfg, body_active)
@@ -394,6 +446,12 @@ impl App {
             .contains(crossterm::event::KeyModifiers::CONTROL);
         if ctrl && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('C')) {
             self.should_quit = true;
+            return;
+        }
+
+        // Do not mutate hidden focus/input state while the full UI is
+        // suspended. Ctrl+C above remains available as the emergency exit.
+        if self.viewport_mode.get() == ViewportMode::TooSmall {
             return;
         }
 
@@ -449,14 +507,14 @@ impl App {
 
         match self.screen {
             Screen::Main => match k.code {
-                KeyCode::Up => self.main.up(&self.cfg, &self.schema),
-                KeyCode::Down => self.main.down(&self.cfg, &self.schema),
+                KeyCode::Up => self.main.up(),
+                KeyCode::Down => self.main.down(),
                 KeyCode::Left => self.main.left(),
                 KeyCode::Right => self.main.right(),
-                KeyCode::PageUp => self.main.page_up(&self.cfg, &self.schema),
-                KeyCode::PageDown => self.main.page_down(&self.cfg, &self.schema),
+                KeyCode::PageUp => self.main.page_up(),
+                KeyCode::PageDown => self.main.page_down(),
                 KeyCode::Enter => {
-                    let act = self.main.activate(&self.cfg, &self.schema);
+                    let act = self.main.activate(&self.cfg);
                     self.apply_main_action(act);
                 }
                 _ => {}
@@ -503,6 +561,9 @@ impl App {
 
     /// Handles a mouse event.
     pub fn on_mouse(&mut self, m: MouseEvent) {
+        if self.viewport_mode.get() == ViewportMode::TooSmall {
+            return;
+        }
         if self.tutorial.is_some() {
             // Tutorial owns the full body rect tracked by the app.
             let area = self.body_inner.get();
@@ -591,7 +652,7 @@ impl App {
         self.focus_menu = false;
         match self.screen {
             Screen::Main => {
-                let act = self.main.on_mouse(m, inner, &self.cfg, &self.schema);
+                let act = self.main.on_mouse(m, inner, &self.cfg);
                 self.apply_main_action(act);
             }
             Screen::ComfySettings => {
@@ -631,6 +692,18 @@ impl App {
                 }
             }
             Screen::About => {}
+        }
+    }
+
+    /// Updates the viewport guard from either a resize event or the actual
+    /// frame area observed by ratatui. Entering the too-small state clears all
+    /// cached hit rectangles so mouse events can never target stale controls.
+    pub fn set_viewport_size(&self, width: u16, height: u16) {
+        let mode = viewport_mode(width, height);
+        self.viewport_mode.set(mode);
+        if mode == ViewportMode::TooSmall {
+            self.body_inner.set(Rect::default());
+            self.menu_rect.set(Rect::default());
         }
     }
 
@@ -736,7 +809,7 @@ impl App {
 
     fn screen_scroll(&mut self, delta: i32) {
         match self.screen {
-            Screen::Main => self.main.scroll(delta, &self.cfg, &self.schema),
+            Screen::Main => self.main.scroll(delta),
             Screen::ComfySettings => self.comfy.scroll(delta, &self.schema),
             Screen::VersionMgmt => self.version.scroll(delta, &self.cfg),
             Screen::LauncherSettings => self.launcher.scroll(delta),
@@ -810,5 +883,22 @@ impl App {
         }
         log_bus::push("launch", format!("execvp python {}", args.join(" ")));
         process::launch_comfyui_and_exit(python, comfy_dir, args, env);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn viewport_boundaries_are_explicit() {
+        assert!(viewport_mode(0, 0) == ViewportMode::TooSmall);
+        assert!(
+            viewport_mode(MIN_VIEWPORT_WIDTH - 1, MIN_VIEWPORT_HEIGHT) == ViewportMode::TooSmall
+        );
+        assert!(
+            viewport_mode(MIN_VIEWPORT_WIDTH, MIN_VIEWPORT_HEIGHT - 1) == ViewportMode::TooSmall
+        );
+        assert!(viewport_mode(MIN_VIEWPORT_WIDTH, MIN_VIEWPORT_HEIGHT) == ViewportMode::Ready);
     }
 }

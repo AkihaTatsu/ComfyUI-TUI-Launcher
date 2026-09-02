@@ -7,6 +7,9 @@
 use crate::core::config::Network;
 use std::collections::HashMap;
 
+/// Environment variable read by the in-memory Huggingface URL rewrite wrapper.
+pub const HF_FORCE_MIRROR_ENV: &str = "COMFYUI_TUI_HF_MIRROR";
+
 /// Builds the environment variables to inject into child processes based on
 /// the supplied `Network` settings.
 ///
@@ -28,9 +31,12 @@ pub fn build(n: &Network) -> HashMap<String, String> {
     }
 
     // ── Huggingface ────────────────────────────────────────────────────
-    // HF honours one endpoint only — use the first item.
-    if let Some(first) = split_list(&n.hf_mirror).next() {
-        e.insert("HF_ENDPOINT".into(), first.to_string());
+    // HF honours one endpoint only — use the first valid item.
+    if let Some(endpoint) = normalize_hf_endpoint(&n.hf_mirror) {
+        e.insert("HF_ENDPOINT".into(), endpoint.clone());
+        if n.hf_force_mirror {
+            e.insert(HF_FORCE_MIRROR_ENV.into(), endpoint);
+        }
     }
 
     // ── Git insteadOf rules ────────────────────────────────────────────
@@ -96,4 +102,121 @@ fn split_list(s: &str) -> impl Iterator<Item = &str> {
 /// save and load so the on-disk file always uses the tight `a;b;c` form.
 pub fn normalize_semicolon_list(s: &str) -> String {
     split_list(s).collect::<Vec<&str>>().join(";")
+}
+
+/// Returns a canonical Huggingface endpoint, or `None` when unset/invalid.
+pub fn normalize_hf_endpoint(s: &str) -> Option<String> {
+    let mut raw = split_list(s).next()?.replace('\\', "/");
+    raw = raw.trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    for scheme in ["https", "http"] {
+        let single_slash = format!("{scheme}:/");
+        let double_slash = format!("{scheme}://");
+        if raw.starts_with(&single_slash) && !raw.starts_with(&double_slash) {
+            raw = format!(
+                "{double_slash}{}",
+                raw[single_slash.len()..].trim_start_matches('/')
+            );
+            break;
+        }
+    }
+    if !raw.contains("://") {
+        raw = format!("https://{raw}");
+    }
+    while raw.ends_with('/') {
+        raw.pop();
+    }
+
+    if !has_valid_http_url_shape(&raw) {
+        return None;
+    }
+    Some(raw)
+}
+
+fn has_valid_http_url_shape(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    if !matches!(scheme, "http" | "https") || rest.is_empty() {
+        return false;
+    }
+    let host_port = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim_matches('/');
+    if host_port.is_empty() || host_port.contains('@') || host_port.contains(char::is_whitespace) {
+        return false;
+    }
+    let host = host_port.split(':').next().unwrap_or("");
+    !host.is_empty() && host.contains('.') && !host.starts_with('.') && !host.ends_with('.')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_hf_endpoint() {
+        assert_eq!(
+            normalize_hf_endpoint("hf-mirror.com/"),
+            Some("https://hf-mirror.com".into())
+        );
+        assert_eq!(
+            normalize_hf_endpoint(" https://hf-mirror.com/// "),
+            Some("https://hf-mirror.com".into())
+        );
+        assert_eq!(
+            normalize_hf_endpoint("https:\\hf-mirror.com\\"),
+            Some("https://hf-mirror.com".into())
+        );
+        assert_eq!(
+            normalize_hf_endpoint("https://a.example/;https://b.example/"),
+            Some("https://a.example".into())
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_hf_endpoint() {
+        for bad in [
+            "",
+            "   ",
+            "ftp://hf-mirror.com",
+            "https://",
+            "https://local host",
+        ] {
+            assert_eq!(normalize_hf_endpoint(bad), None);
+        }
+    }
+
+    #[test]
+    fn force_mirror_requires_valid_endpoint() {
+        let mut n = Network {
+            hf_force_mirror: true,
+            ..Network::default()
+        };
+        assert!(!build(&n).contains_key("HF_ENDPOINT"));
+        assert!(!build(&n).contains_key(HF_FORCE_MIRROR_ENV));
+
+        n.hf_mirror = "hf-mirror.com/".into();
+        let env = build(&n);
+        assert_eq!(
+            env.get("HF_ENDPOINT"),
+            Some(&"https://hf-mirror.com".into())
+        );
+        assert_eq!(
+            env.get(HF_FORCE_MIRROR_ENV),
+            Some(&"https://hf-mirror.com".into())
+        );
+
+        n.hf_force_mirror = false;
+        let env = build(&n);
+        assert_eq!(
+            env.get("HF_ENDPOINT"),
+            Some(&"https://hf-mirror.com".into())
+        );
+        assert!(!env.contains_key(HF_FORCE_MIRROR_ENV));
+    }
 }

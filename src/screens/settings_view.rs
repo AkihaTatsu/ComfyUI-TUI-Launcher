@@ -22,7 +22,11 @@ use crate::widgets::focus_grid::{FocusGrid, RowKind};
 use crate::widgets::input::Input;
 use crate::widgets::popup::input_popup::InputPopup;
 use crate::widgets::popup::select::Select;
-use crate::widgets::{dropdown, tabs::Tabs, toggle};
+use crate::widgets::{
+    dropdown,
+    tabs::{Tabs, TabsState},
+    toggle,
+};
 use crossterm::event::{KeyCode, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
@@ -55,6 +59,8 @@ pub enum Popup {
 pub struct SettingsView {
     /// Active tab index.
     pub tab: usize,
+    /// Persistent horizontal viewport for the settings tab strip.
+    tabs_state: TabsState,
     /// Saved tab index to restore when cross-tab search is cleared.
     saved_tab: Option<usize>,
     /// Centralized focus grid: Row 0 = filter input, Row 1 = field list.
@@ -83,6 +89,7 @@ impl SettingsView {
         grid.set_focus(1, 0);
         Self {
             tab: 0,
+            tabs_state: TabsState::default(),
             saved_tab: None,
             grid,
             popup: Popup::None,
@@ -228,6 +235,7 @@ impl SettingsView {
                 Tabs {
                     items: &names,
                     selected: self.tab,
+                    state: &self.tabs_state,
                     highlighted: Some(&highlighted),
                 }
                 .render(f, v[0]);
@@ -235,6 +243,7 @@ impl SettingsView {
                 Tabs {
                     items: &names,
                     selected: self.tab,
+                    state: &self.tabs_state,
                     highlighted: None,
                 }
                 .render(f, v[0]);
@@ -495,6 +504,23 @@ impl SettingsView {
             }
             _ => {
                 let filter_was_empty = self.filter.value.is_empty();
+                let n = self.filtered_fields(schema).len();
+                self.grid.set_list_len(n);
+                self.grid.set_visible_rows(self.visible.get().max(1));
+
+                // Page keys navigate the same two-row focus grid as Up/Down
+                // and must not be routed into the filter Input.
+                match code {
+                    KeyCode::PageUp => {
+                        self.grid.page_up();
+                        return true;
+                    }
+                    KeyCode::PageDown => {
+                        self.grid.page_down();
+                        return true;
+                    }
+                    _ => {}
+                }
 
                 // Filter input has focus — route typing keys there.
                 if self.filter_focused() {
@@ -503,15 +529,12 @@ impl SettingsView {
                             self.grid.set_focus(1, 0);
                         }
                         KeyCode::Enter | KeyCode::Down => {
-                            self.grid.set_focus(1, 0);
-                            self.grid.set_list_selected(0);
+                            self.grid.move_down();
                             self.scroll.set(0);
                         }
                         KeyCode::Up => {
-                            let n = self.filtered_fields(schema).len();
                             if n > 0 {
-                                self.grid.set_focus(1, 0);
-                                self.grid.set_list_selected(n - 1);
+                                self.grid.move_up();
                             }
                         }
                         KeyCode::Tab | KeyCode::BackTab => {
@@ -560,33 +583,16 @@ impl SettingsView {
                     return true;
                 }
                 // Field list has focus.
-                let n = self.filtered_fields(schema).len();
                 match code {
                     KeyCode::Tab | KeyCode::BackTab => {
                         self.grid.set_focus(0, 0);
                     }
                     KeyCode::Up => {
-                        if self.grid.list_selected() == 0 {
-                            self.grid.set_focus(0, 0);
-                        } else {
-                            self.grid.set_list_selected(self.grid.list_selected() - 1);
-                        }
+                        self.grid.move_up();
                     }
                     KeyCode::Down => {
-                        if n > 0 && self.grid.list_selected() + 1 >= n {
-                            self.grid.set_focus(0, 0);
-                        } else if n > 0 {
-                            self.grid.set_list_selected(self.grid.list_selected() + 1);
-                        }
-                    }
-                    KeyCode::PageUp => {
-                        self.grid.set_focus(0, 0);
-                    }
-                    KeyCode::PageDown => {
                         if n > 0 {
-                            self.grid.set_list_selected(n - 1);
-                        } else {
-                            self.grid.set_focus(0, 0);
+                            self.grid.move_down();
                         }
                     }
                     KeyCode::Right => {
@@ -796,6 +802,7 @@ impl SettingsView {
                 if let Some(h) = (crate::widgets::tabs::Tabs {
                     items: &names,
                     selected: self.tab,
+                    state: &self.tabs_state,
                     highlighted: None,
                 })
                 .hit(v[0], m.column)
@@ -888,34 +895,14 @@ impl SettingsView {
             return;
         }
         let n = self.filtered_fields(schema).len();
-        if n == 0 {
+        if n == 0 || delta == 0 {
             return;
         }
-        if delta < 0 {
-            if self.filter_focused() {
-                self.grid.set_focus(1, 0);
-                self.grid.set_list_selected(n - 1);
-                return;
-            }
-            if self.grid.list_selected() == 0 {
-                self.grid.set_focus(0, 0);
-                return;
-            }
-            self.grid.set_list_selected(self.grid.list_selected() - 1);
-            return;
-        }
-        if delta > 0 {
-            if self.filter_focused() {
-                self.grid.set_focus(1, 0);
-                self.grid.set_list_selected(0);
-                self.scroll.set(0);
-                return;
-            }
-            if self.grid.list_selected() + 1 >= n {
-                self.grid.set_focus(0, 0);
-                return;
-            }
-            self.grid.set_list_selected(self.grid.list_selected() + 1);
+        self.grid.set_list_len(n);
+        self.grid.set_visible_rows(self.visible.get().max(1));
+        self.grid.scroll(delta);
+        if delta > 0 && self.grid.in_list() && self.grid.list_selected() == 0 {
+            self.scroll.set(0);
         }
     }
 }
@@ -930,4 +917,52 @@ fn gpu_choice_value(idx: usize) -> Option<String> {
     }
     let gpus = gpu::last_detected();
     gpus.get(idx - 1).map(|g| g.config_value())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_down_works_after_page_up_focuses_filter() {
+        let schema: Schema = toml::from_str(
+            r#"
+                [[tab]]
+                name = "test"
+                [[tab.field]]
+                key = "one"
+                name = "one"
+                type = "toggle"
+                [[tab.field]]
+                key = "two"
+                name = "two"
+                type = "toggle"
+                [[tab.field]]
+                key = "three"
+                name = "three"
+                type = "toggle"
+            "#,
+        )
+        .unwrap();
+        let mut view = SettingsView::new();
+        let mut cfg = Config::default();
+
+        view.on_key(
+            KeyCode::PageUp,
+            &schema,
+            &mut cfg,
+            |_, _| Value::Boolean(false),
+            |_, _, _| Ok(()),
+        );
+        assert!(view.filter_focused());
+
+        view.on_key(
+            KeyCode::PageDown,
+            &schema,
+            &mut cfg,
+            |_, _| Value::Boolean(false),
+            |_, _, _| Ok(()),
+        );
+        assert_eq!((view.grid.row(), view.grid.list_selected()), (1, 2));
+    }
 }

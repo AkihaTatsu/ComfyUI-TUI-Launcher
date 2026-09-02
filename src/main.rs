@@ -18,7 +18,17 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io::stdout;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const EVENT_BATCH_LIMIT: usize = 256;
+const HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(33);
+
+fn latest_resize(events: &[Event]) -> Option<(u16, u16)> {
+    events.iter().rev().find_map(|event| match event {
+        Event::Resize(width, height) => Some((*width, *height)),
+        _ => None,
+    })
+}
 
 /// Installs a panic hook that restores the terminal to a cooked state before
 /// the default handler runs, so a crash does not leave the user stranded in
@@ -105,19 +115,93 @@ fn run_loop(
     term: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut crate::app::App,
 ) -> Result<()> {
+    let (initial_w, initial_h) = crossterm::terminal::size()?;
+    let mut was_too_small =
+        initial_w < crate::app::MIN_VIEWPORT_WIDTH || initial_h < crate::app::MIN_VIEWPORT_HEIGHT;
+    app.set_viewport_size(initial_w, initial_h);
+    let mut next_tick = Instant::now();
+    let mut dirty = true;
+    let mut redraw_until = Instant::now();
+    let mut log_revision = crate::core::log_bus::revision();
+
     loop {
-        app.tick();
-        term.draw(|f| app.draw(f))?;
-        if event::poll(Duration::from_millis(150))? {
-            match event::read()? {
+        let now = Instant::now();
+        let wait = next_tick.saturating_duration_since(now);
+        let mut events = Vec::new();
+        if event::poll(wait)? {
+            events.push(event::read()?);
+            while events.len() < EVENT_BATCH_LIMIT && event::poll(Duration::ZERO)? {
+                events.push(event::read()?);
+            }
+        }
+        if !events.is_empty() {
+            dirty = true;
+            // Deferred buttons deliberately fire on a later tick. Keep a
+            // short redraw grace period so their pressed/focused state and
+            // resulting popup are both observable.
+            redraw_until = Instant::now() + Duration::from_millis(250);
+        }
+
+        // Resize notifications are explicitly allowed to arrive in bursts.
+        // Use the newest dimensions and render once after draining the batch.
+        let latest_resize = latest_resize(&events);
+        let mut recovered = false;
+        if let Some((w, h)) = latest_resize {
+            let too_small =
+                w < crate::app::MIN_VIEWPORT_WIDTH || h < crate::app::MIN_VIEWPORT_HEIGHT;
+            recovered = was_too_small && !too_small;
+            was_too_small = too_small;
+            app.set_viewport_size(w, h);
+        }
+
+        for e in events {
+            match e {
                 Event::Key(k) if k.kind == KeyEventKind::Press => app.on_key(k),
-                Event::Mouse(m) => app.on_mouse(m),
-                Event::Resize(_, _) => {}
+                // Mouse coordinates gathered during a resize burst refer to
+                // an indeterminate layout. Drop them instead of dispatching
+                // against stale hit rectangles.
+                Event::Mouse(m) if latest_resize.is_none() => app.on_mouse(m),
                 _ => {}
             }
         }
+
+        dirty |= app.tick();
+        let current_log_revision = crate::core::log_bus::revision();
+        if current_log_revision != log_revision {
+            log_revision = current_log_revision;
+            dirty = true;
+        }
+        dirty |= recovered || latest_resize.is_some() || Instant::now() < redraw_until;
+        if latest_resize.is_some() {
+            term.autoresize()?;
+        }
+        if recovered {
+            term.clear()?;
+        }
+        if dirty {
+            term.draw(|f| app.draw(f))?;
+            dirty = false;
+        }
+        next_tick = Instant::now() + HOUSEKEEPING_INTERVAL;
+
         if app.should_quit || app.should_launch {
             return Ok(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resize_bursts_use_the_newest_dimensions() {
+        let events = [
+            Event::Resize(1, 1),
+            Event::FocusGained,
+            Event::Resize(80, 24),
+            Event::Resize(120, 40),
+        ];
+        assert_eq!(latest_resize(&events), Some((120, 40)));
     }
 }

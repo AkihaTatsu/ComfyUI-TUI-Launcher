@@ -20,6 +20,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets
+      - name: Test clipboard through default tmux isolation
+        if: runner.os == 'Linux'
+        run: bash scripts/test-clipboard-multiplexers.sh ssh tmux
       - run: cargo build --release
       - uses: actions/upload-artifact@v4
         with:
@@ -28,3 +32,23 @@ jobs:
             target/release/comfyui-tui-launcher
             target/release/comfyui-tui-launcher.exe
           if-no-files-found: ignore
+
+  bsd-check:
+    name: Check ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-freebsd
+          - x86_64-unknown-netbsd
+          - x86_64-unknown-openbsd
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo check --target ${{ matrix.target }}

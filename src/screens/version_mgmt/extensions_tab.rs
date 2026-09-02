@@ -9,6 +9,7 @@ use crate::app::FlashKind;
 use crate::core::config::Config;
 use crate::core::paths::ComfyDirs;
 use crate::core::{clipboard, env, git, i18n, opener, pip, theme};
+use crate::widgets::focus_grid::{FocusGrid, RowKind};
 use crate::widgets::input::Input;
 use crate::widgets::popup;
 use crate::widgets::popup::confirm::Confirm;
@@ -128,27 +129,12 @@ pub struct Extension {
     pub behind: u32,
 }
 
-/// Which control on the Extensions tab currently holds focus.
-#[derive(Copy, Clone, PartialEq, Eq)]
-pub enum ExtFocus {
-    /// Search input.
-    Search,
-    /// Update All button.
-    UpdateAll,
-    /// Reinstall All button.
-    ReinstallAll,
-    /// Extensions table.
-    Table,
-}
-
 /// Installed extensions tab state.
 pub struct ExtensionsTab {
     /// All loaded extensions.
     pub items: Vec<Extension>,
-    /// Index into the filtered view; see [`filtered_indices`](Self::filtered_indices).
-    pub selected: usize,
-    /// Scroll offset into the filtered view.
-    pub scroll: usize,
+    /// Row 0 contains Search/Update All/Reinstall All; row 1 is the table.
+    pub grid: FocusGrid,
     /// Confirmation popup.
     pub confirm: Option<Confirm>,
     /// Notice popup.
@@ -169,11 +155,6 @@ pub struct ExtensionsTab {
     pub visible_rows: Cell<usize>,
     /// Search input filtering the table.
     pub search: Input,
-    /// Currently focused control.
-    pub focus: ExtFocus,
-    /// Last focused column in row 0 (Search/UpdateAll/ReinstallAll), restored
-    /// when navigating back up from the table.
-    pub last_row0_focus: ExtFocus,
     /// Flash message awaiting promotion to the application banner.
     pub pending_flash: Option<(FlashKind, String)>,
     /// Update All bulk-action button.
@@ -190,7 +171,7 @@ impl ExtensionsTab {
 
     /// Whether any text input widget currently has keyboard focus.
     pub fn text_input_focused(&self) -> bool {
-        self.focus == ExtFocus::Search
+        self.grid.row() == 0 && self.grid.col() == 0
     }
 
     fn copy_to_clipboard(&mut self, s: String) {
@@ -199,10 +180,11 @@ impl ExtensionsTab {
 
     /// Constructs a fresh Extensions tab.
     pub fn new() -> Self {
+        let mut grid = FocusGrid::new(vec![RowKind::Fixed(3), RowKind::List]);
+        grid.set_focus(1, 0);
         Self {
             items: vec![],
-            selected: 0,
-            scroll: 0,
+            grid,
             confirm: None,
             notice: None,
             pending_delete: None,
@@ -214,8 +196,6 @@ impl ExtensionsTab {
             end_reached: false,
             visible_rows: Cell::new(0),
             search: Input::default().placeholder("placeholder_search"),
-            focus: ExtFocus::Table,
-            last_row0_focus: ExtFocus::Search,
             btn_update_all: crate::widgets::button::Button::new(
                 crate::widgets::button::ButtonKind::Primary,
             ),
@@ -304,22 +284,16 @@ impl ExtensionsTab {
 
     /// Returns the real `items` index for the currently selected row.
     fn current_real_idx(&self) -> Option<usize> {
-        self.filtered_indices().get(self.selected).copied()
+        self.filtered_indices()
+            .get(self.grid.list_selected())
+            .copied()
     }
 
     /// Clamps the scroll offset so the selected row is on-screen.
     pub fn ensure_visible(&mut self) {
-        let v = self.visible_rows.get().max(1);
-        if self.selected < self.scroll {
-            self.scroll = self.selected;
-        }
-        let max_off = self.selected.saturating_sub(v - 1);
-        if self.scroll < max_off {
-            self.scroll = max_off;
-        }
-        if self.scroll > self.selected {
-            self.scroll = self.selected;
-        }
+        self.grid.set_list_len(self.filtered_indices().len());
+        self.grid.set_visible_rows(self.visible_rows.get().max(1));
+        self.grid.ensure_visible();
     }
 
     /// Renders the tab into `area`.
@@ -348,19 +322,22 @@ impl ExtensionsTab {
                 Constraint::Length(rei_w),
             ])
             .split(v[0]);
-        self.search
-            .render(f, top[0], self.focus == ExtFocus::Search && active);
+        self.search.render(
+            f,
+            top[0],
+            self.grid.row() == 0 && self.grid.col() == 0 && active,
+        );
         self.btn_update_all.render(
             f,
             top[1],
             &i18n::t("btn_update_all"),
-            self.focus == ExtFocus::UpdateAll && active,
+            self.grid.row() == 0 && self.grid.col() == 1 && active,
         );
         self.btn_reinstall_all.render(
             f,
             top[2],
             &i18n::t("btn_reinstall_all"),
-            self.focus == ExtFocus::ReinstallAll && active,
+            self.grid.row() == 0 && self.grid.col() == 2 && active,
         );
 
         let table_area = v[1];
@@ -401,8 +378,8 @@ impl ExtensionsTab {
         Table {
             columns: &cols,
             row_count: filtered.len(),
-            selected: self.selected,
-            scroll: self.scroll,
+            selected: self.grid.list_selected(),
+            scroll: self.grid.list_scroll(),
         }
         .render_styled(
             f,
@@ -429,7 +406,7 @@ impl ExtensionsTab {
                     None
                 }
             },
-            active && self.focus == ExtFocus::Table,
+            active && self.grid.row() == 1,
         );
 
         if let Some(vp) = &self.version_picker {
@@ -476,8 +453,8 @@ impl ExtensionsTab {
         let inner = Rect {
             x: r.x + 1,
             y: r.y + 1,
-            width: r.width - 2,
-            height: r.height - 2,
+            width: r.width.saturating_sub(2),
+            height: r.height.saturating_sub(2),
         };
         if vp.commits.is_empty() {
             let lines = vec![Line::from(Span::styled(
@@ -566,8 +543,8 @@ impl ExtensionsTab {
             let inner = Rect {
                 x: r.x + 1,
                 y: r.y + 1,
-                width: r.width - 2,
-                height: r.height - 2,
+                width: r.width.saturating_sub(2),
+                height: r.height.saturating_sub(2),
             };
             // Table content rows start at inner.y + 2 (table border + header).
             if m.column >= inner.x
@@ -649,35 +626,32 @@ impl ExtensionsTab {
             // Arm the Button's deferred-fire pipeline. The action request
             // is built by `poll_button_action` two frames later, after one
             // full frame of visible focus highlight.
-            self.focus = ExtFocus::UpdateAll;
-            self.last_row0_focus = ExtFocus::UpdateAll;
+            self.grid.set_focus(0, 1);
             self.btn_update_all.click();
             return None;
         }
         if inside(rei_btn_area) {
-            self.focus = ExtFocus::ReinstallAll;
-            self.last_row0_focus = ExtFocus::ReinstallAll;
+            self.grid.set_focus(0, 2);
             self.btn_reinstall_all.click();
             return None;
         }
         if inside(search_area) {
-            self.focus = ExtFocus::Search;
-            self.last_row0_focus = ExtFocus::Search;
+            self.grid.set_focus(0, 0);
             return None;
         }
-        self.focus = ExtFocus::Table;
+        self.grid.set_focus(1, 0);
         let top = table_area.y + 2;
         if m.row < top {
             return None;
         }
         let rel = (m.row - top) as usize;
-        let view_idx = self.scroll + rel;
+        let view_idx = self.grid.list_scroll() + rel;
         let filtered = self.filtered_indices();
         if view_idx >= filtered.len() {
             return None;
         }
-        if view_idx != self.selected {
-            self.selected = view_idx;
+        if view_idx != self.grid.list_selected() {
+            self.grid.set_list_selected(view_idx);
             return None;
         }
         let ext = self.items[filtered[view_idx]].clone();
@@ -699,81 +673,29 @@ impl ExtensionsTab {
         if n == 0 {
             return;
         }
-        if delta < 0 {
-            if matches!(
-                self.focus,
-                ExtFocus::Search | ExtFocus::UpdateAll | ExtFocus::ReinstallAll
-            ) {
-                self.focus = ExtFocus::Table;
-                self.selected = n - 1;
-            } else if self.selected == 0 {
-                self.focus = self.last_row0_focus;
-            } else {
-                self.selected -= 1;
-            }
-        } else {
-            if matches!(
-                self.focus,
-                ExtFocus::Search | ExtFocus::UpdateAll | ExtFocus::ReinstallAll
-            ) {
-                self.focus = ExtFocus::Table;
-                self.selected = 0;
-                self.scroll = 0;
-            } else if self.selected + 1 >= n {
-                self.focus = self.last_row0_focus;
-            } else {
-                self.selected += 1;
-            }
-        }
-        self.ensure_visible();
+        self.grid.set_list_len(n);
+        self.grid.set_visible_rows(self.visible_rows.get().max(1));
+        self.grid.scroll(delta);
     }
 
     /// Attempts to handle a Left arrow within this tab.
     /// Returns `true` if the key was consumed.
     pub fn on_left(&mut self) -> bool {
-        match self.focus {
-            ExtFocus::Search => {
-                if !self.search.at_start() {
-                    self.search.on_key(KeyCode::Left);
-                    return true;
-                }
-                false // propagate to tab switch
-            }
-            ExtFocus::UpdateAll => {
-                self.focus = ExtFocus::Search;
-                self.last_row0_focus = self.focus;
-                true
-            }
-            ExtFocus::ReinstallAll => {
-                self.focus = ExtFocus::UpdateAll;
-                self.last_row0_focus = self.focus;
-                true
-            }
-            ExtFocus::Table => false, // single col, propagate
+        if self.grid.row() == 0 && self.grid.col() == 0 && !self.search.at_start() {
+            self.search.on_key(KeyCode::Left);
+            return true;
         }
+        self.grid.move_left()
     }
 
     /// Attempts to handle a Right arrow within this tab.
     /// Returns `true` if the key was consumed.
     pub fn on_right(&mut self) -> bool {
-        match self.focus {
-            ExtFocus::Search => {
-                if !self.search.at_end() {
-                    self.search.on_key(KeyCode::Right);
-                    return true;
-                }
-                self.focus = ExtFocus::UpdateAll;
-                self.last_row0_focus = self.focus;
-                true
-            }
-            ExtFocus::UpdateAll => {
-                self.focus = ExtFocus::ReinstallAll;
-                self.last_row0_focus = self.focus;
-                true
-            }
-            ExtFocus::ReinstallAll => false, // at right edge, propagate
-            ExtFocus::Table => false,
+        if self.grid.row() == 0 && self.grid.col() == 0 && !self.search.at_end() {
+            self.search.on_key(KeyCode::Right);
+            return true;
         }
+        self.grid.move_right()
     }
 
     /// Handles a key event.
@@ -927,39 +849,48 @@ impl ExtensionsTab {
             return None;
         }
 
+        let n = self.filtered_indices().len();
+        self.grid.set_list_len(n);
+        self.grid.set_visible_rows(self.visible_rows.get().max(1));
+
+        // Page navigation belongs to the complete two-row focus topology,
+        // not whichever input/button happens to be focused.
+        match code {
+            KeyCode::PageUp => {
+                self.grid.page_up();
+                return None;
+            }
+            KeyCode::PageDown => {
+                self.grid.page_down();
+                return None;
+            }
+            _ => {}
+        }
+
         // Search input has focus: typing edits it; Tab moves to UpdateAll;
         // Enter / Esc returns to Table.
-        if self.focus == ExtFocus::Search {
+        if self.grid.row() == 0 && self.grid.col() == 0 {
             match code {
                 KeyCode::Tab => {
-                    self.focus = ExtFocus::UpdateAll;
-                    self.last_row0_focus = self.focus;
+                    self.grid.set_focus(0, 1);
                 }
                 KeyCode::BackTab => {
-                    self.focus = ExtFocus::Table;
+                    self.grid.set_focus(1, 0);
                 }
-                KeyCode::Enter | KeyCode::Down => {
-                    self.last_row0_focus = self.focus;
-                    self.focus = ExtFocus::Table;
-                    self.selected = 0;
-                    self.scroll = 0;
+                KeyCode::Enter => {
+                    self.grid.set_focus(1, 0);
+                    self.grid.set_list_selected(0);
+                    self.grid.set_list_scroll(0);
                 }
-                KeyCode::Up => {
-                    let n = self.filtered_indices().len();
-                    if n > 0 {
-                        self.last_row0_focus = self.focus;
-                        self.focus = ExtFocus::Table;
-                        self.selected = n - 1;
-                        self.ensure_visible();
-                    }
-                }
+                KeyCode::Up => self.grid.move_up(),
+                KeyCode::Down => self.grid.move_down(),
                 KeyCode::Esc => {
-                    self.focus = ExtFocus::Table;
+                    self.grid.set_focus(1, 0);
                 }
                 k if !matches!(k, KeyCode::Left | KeyCode::Right) => {
                     self.search.on_key(k);
-                    self.selected = 0;
-                    self.scroll = 0;
+                    self.grid.set_list_selected(0);
+                    self.grid.set_list_scroll(0);
                 }
                 _ => {}
             }
@@ -967,37 +898,26 @@ impl ExtensionsTab {
         }
 
         // UpdateAll button focused: Enter runs update-all; Tab cycles on.
-        if self.focus == ExtFocus::UpdateAll {
+        if self.grid.row() == 0 && self.grid.col() == 1 {
             match code {
                 KeyCode::Tab => {
-                    self.focus = ExtFocus::ReinstallAll;
-                    self.last_row0_focus = self.focus;
+                    self.grid.set_focus(0, 2);
                     return None;
                 }
                 KeyCode::BackTab => {
-                    self.focus = ExtFocus::Search;
-                    self.last_row0_focus = self.focus;
+                    self.grid.set_focus(0, 0);
                     return None;
                 }
                 KeyCode::Esc => {
-                    self.focus = ExtFocus::Table;
-                    return None;
-                }
-                KeyCode::Down => {
-                    self.last_row0_focus = self.focus;
-                    self.focus = ExtFocus::Table;
-                    self.selected = 0;
-                    self.scroll = 0;
+                    self.grid.set_focus(1, 0);
                     return None;
                 }
                 KeyCode::Up => {
-                    let n = self.filtered_indices().len();
-                    if n > 0 {
-                        self.last_row0_focus = self.focus;
-                        self.focus = ExtFocus::Table;
-                        self.selected = n - 1;
-                        self.ensure_visible();
-                    }
+                    self.grid.move_up();
+                    return None;
+                }
+                KeyCode::Down => {
+                    self.grid.move_down();
                     return None;
                 }
                 KeyCode::Enter => {
@@ -1011,36 +931,26 @@ impl ExtensionsTab {
         }
 
         // ReinstallAll button focused: Enter runs the force-sync.
-        if self.focus == ExtFocus::ReinstallAll {
+        if self.grid.row() == 0 && self.grid.col() == 2 {
             match code {
                 KeyCode::Tab => {
-                    self.focus = ExtFocus::Table;
+                    self.grid.set_focus(1, 0);
                     return None;
                 }
                 KeyCode::BackTab => {
-                    self.focus = ExtFocus::UpdateAll;
-                    self.last_row0_focus = self.focus;
+                    self.grid.set_focus(0, 1);
                     return None;
                 }
                 KeyCode::Esc => {
-                    self.focus = ExtFocus::Table;
-                    return None;
-                }
-                KeyCode::Down => {
-                    self.last_row0_focus = self.focus;
-                    self.focus = ExtFocus::Table;
-                    self.selected = 0;
-                    self.scroll = 0;
+                    self.grid.set_focus(1, 0);
                     return None;
                 }
                 KeyCode::Up => {
-                    let n = self.filtered_indices().len();
-                    if n > 0 {
-                        self.last_row0_focus = self.focus;
-                        self.focus = ExtFocus::Table;
-                        self.selected = n - 1;
-                        self.ensure_visible();
-                    }
+                    self.grid.move_up();
+                    return None;
+                }
+                KeyCode::Down => {
+                    self.grid.move_down();
                     return None;
                 }
                 KeyCode::Enter => {
@@ -1054,34 +964,27 @@ impl ExtensionsTab {
         }
 
         if matches!(code, KeyCode::Tab) {
-            self.focus = self.last_row0_focus;
+            self.grid.page_up();
             return None;
         }
         if matches!(code, KeyCode::BackTab) {
-            self.focus = ExtFocus::ReinstallAll;
+            self.grid.set_focus(0, 2);
             return None;
         }
 
-        let filtered = self.filtered_indices();
-        let n = filtered.len();
         match code {
             KeyCode::Up => {
                 if n == 0 {
                     return None;
                 }
-                if self.selected == 0 {
-                    self.focus = self.last_row0_focus;
-                } else {
-                    self.selected -= 1;
-                }
-                self.ensure_visible();
+                self.grid.move_up();
                 None
             }
             KeyCode::Down => {
                 if n == 0 {
                     return None;
                 }
-                if self.selected + 1 >= n {
+                if self.grid.list_selected() + 1 >= n {
                     if !self.end_reached && self.search.value.is_empty() {
                         let new_limit = self.limit.saturating_add(LIST_MAX_NUM);
                         return Some(load_request_with_limit(
@@ -1090,43 +993,15 @@ impl ExtensionsTab {
                             env::build(&cfg.network),
                         ));
                     }
-                    self.focus = self.last_row0_focus;
-                    self.ensure_visible();
+                    self.grid.move_down();
                     return None;
                 }
-                self.selected += 1;
-                self.ensure_visible();
-                None
-            }
-            KeyCode::PageUp => {
-                self.focus = self.last_row0_focus;
-                None
-            }
-            KeyCode::PageDown => {
-                if n > 0 {
-                    self.selected = n - 1;
-                }
-                self.ensure_visible();
+                self.grid.move_down();
                 None
             }
             KeyCode::Char('r') | KeyCode::Char('R') => {
-                // Re-populate from disk immediately so new / removed dirs are
-                // visible without waiting for the background fetch; then kick
-                // off the refresh that recomputes the `behind` column.
                 let limit = self.limit;
-                self.items = scan_local(&root, limit);
-                self.end_reached = self.items.len() < limit;
-                self.loaded_for = Some(root.clone());
-                let n = self.filtered_indices().len();
-                if self.selected >= n {
-                    self.selected = n.saturating_sub(1);
-                }
-                self.ensure_visible();
-                Some(load_request_with_limit(
-                    root,
-                    limit,
-                    env::build(&cfg.network),
-                ))
+                Some(local_load_request(root, limit, env::build(&cfg.network)))
             }
             KeyCode::Char('d') | KeyCode::Char('D') => {
                 if let Some(real) = self.current_real_idx() {
@@ -1351,6 +1226,7 @@ pub fn load_request_with_limit(
         title: i18n::t("task_ext_load"),
         then: TaskKind::None,
         is_refresh: true,
+        changes_repository: false,
         work: Box::new(move |tx| {
             use std::sync::{
                 atomic::{AtomicUsize, Ordering},
@@ -1389,6 +1265,14 @@ pub fn load_request_with_limit(
             }
             let total = entries.len();
             let _ = tx.send(TaskResult::Progress { done: 0, total });
+            if total == 0 {
+                let _ = tx.send(TaskResult::ExtData {
+                    items: Vec::new(),
+                    root,
+                    requested_limit: limit,
+                });
+                return super::TaskOutcome::Success;
+            }
 
             // Parallel git fetch + info collection. Chunk-disjoint partition
             // across SCAN_WORKERS threads; each thread bumps a shared counter
@@ -1460,12 +1344,46 @@ pub fn load_request_with_limit(
                 root,
                 requested_limit: limit,
             });
+            super::TaskOutcome::Success
+        }),
+    }
+}
+
+/// Background local-only scan followed by the remote refresh. No repository
+/// process is ever spawned from the input handler or application tick.
+pub fn local_load_request(
+    root: PathBuf,
+    limit: usize,
+    env_vars: std::collections::HashMap<String, String>,
+) -> TaskRequest {
+    let then = TaskKind::ExtLoad {
+        root: root.clone(),
+        env: env_vars,
+        limit,
+    };
+    TaskRequest {
+        title: i18n::t("task_ext_load"),
+        then,
+        is_refresh: true,
+        changes_repository: false,
+        work: Box::new(move |tx| {
+            let items = scan_local(&root, limit);
+            let _ = tx.send(TaskResult::ExtData {
+                items,
+                root,
+                requested_limit: limit,
+            });
+            super::TaskOutcome::Success
         }),
     }
 }
 
 /// Cap on parallel git workers for the scan / Update All / Reinstall All
-/// tasks. 8 hits the typical sweet spot for git-fetch-dominated workloads.
+/// tasks. Windows process creation and console I/O are substantially more
+/// expensive, so use a smaller bound there.
+#[cfg(windows)]
+const SCAN_WORKERS: usize = 4;
+#[cfg(not(windows))]
 const SCAN_WORKERS: usize = 8;
 
 pub(super) fn update_one_request(
@@ -1480,17 +1398,40 @@ pub(super) fn update_one_request(
         title,
         then: TaskKind::None,
         is_refresh: false,
+        changes_repository: true,
         work: Box::new(move |tx| {
-            sync_to_upstream(&path, &env_vars);
+            if let Err(e) = sync_to_upstream(&path, &env_vars) {
+                return super::TaskOutcome::failure(name, "git sync", e.to_string());
+            }
+            let mut failures = Vec::new();
             if !python.is_empty() {
-                let _ = pip::install_requirements(std::path::Path::new(&python), &path, env_vars);
+                let pip_ok =
+                    pip::install_requirements(std::path::Path::new(&python), &path, env_vars)
+                        .unwrap_or(false);
+                if !pip_ok {
+                    failures.push(super::ItemFailure::new(
+                        &name,
+                        "pip install",
+                        "source changed, but dependency installation failed; see the task log",
+                    ));
+                }
             }
             if let Some(ext) = read_one_local(&path) {
                 let _ = tx.send(TaskResult::ExtRowUpdate {
                     old_path: path,
                     ext,
                 });
+            } else {
+                failures.push(super::ItemFailure::new(
+                    &name,
+                    "read state",
+                    "repository changed, but its new state could not be read",
+                ));
             }
+            if !failures.is_empty() {
+                return super::TaskOutcome::PartialFailure(failures);
+            }
+            super::TaskOutcome::Success
         }),
     }
 }
@@ -1504,23 +1445,27 @@ pub(super) fn update_one_request(
 ///      a branch, otherwise whatever was just fetched (`FETCH_HEAD`).
 ///   3. `git reset --hard <target>` — discards local edits to tracked files;
 ///      untracked files (user data) are left alone.
-fn sync_to_upstream(path: &std::path::Path, env_vars: &std::collections::HashMap<String, String>) {
-    let _ = git::fetch(path, env_vars.clone());
-    // On a branch with upstream → `@{u}` is well-defined.
-    // Detached HEAD → fall back to `origin/HEAD` (the remote default branch,
-    // set by `git clone`). Final fallback `FETCH_HEAD` covers the rare repo
-    // with no `origin/HEAD` symref. `git::current_branch` now correctly
-    // returns None for detached HEAD so this branch is taken there.
+fn sync_to_upstream(
+    path: &std::path::Path,
+    env_vars: &std::collections::HashMap<String, String>,
+) -> anyhow::Result<()> {
+    if !git::fetch(path, env_vars.clone())? {
+        anyhow::bail!("git fetch failed; see the task log");
+    }
+    // Prefer `@{u}` on a branch, then retain fallbacks for repositories whose
+    // branch has no configured upstream. Detached HEAD begins directly with
+    // `origin/HEAD`; `FETCH_HEAD` covers a missing remote-default symref.
     let targets: &[&str] = if git::current_branch(path).is_some() {
-        &["@{u}"]
+        &["@{u}", "origin/HEAD", "FETCH_HEAD"]
     } else {
         &["origin/HEAD", "FETCH_HEAD"]
     };
     for t in targets {
         if git::reset_hard(path, t, env_vars.clone()).unwrap_or(false) {
-            return;
+            return Ok(());
         }
     }
+    anyhow::bail!("no upstream target could be reset; see the task log")
 }
 
 fn update_all_request(
@@ -1529,47 +1474,120 @@ fn update_all_request(
     env_vars: std::collections::HashMap<String, String>,
     python: String,
 ) -> TaskRequest {
-    let then = TaskKind::ExtLoad(root);
+    bulk_sync_request(
+        i18n::t("task_ext_update_all"),
+        items,
+        root,
+        env_vars,
+        python,
+    )
+}
+
+/// Runs bounded parallel Git synchronization, then installs requirements
+/// strictly one repository at a time because every pip command mutates the
+/// same Python environment.
+fn bulk_sync_request(
+    title: String,
+    items: Vec<Extension>,
+    root: PathBuf,
+    env_vars: std::collections::HashMap<String, String>,
+    python: String,
+) -> TaskRequest {
+    let then = TaskKind::ExtLoad {
+        root: root.clone(),
+        env: env_vars.clone(),
+        limit: super::LIST_MAX_NUM,
+    };
     TaskRequest {
-        title: i18n::t("task_ext_update_all"),
+        title,
         then,
         is_refresh: false,
+        changes_repository: true,
         work: Box::new(move |tx| {
-            use std::sync::{
-                atomic::{AtomicUsize, Ordering},
-                Arc,
-            };
             let managed: Vec<Extension> = items.into_iter().filter(|e| e.managed).collect();
             let total = managed.len();
             let _ = tx.send(TaskResult::Progress { done: 0, total });
+            if total == 0 {
+                return super::TaskOutcome::Success;
+            }
+
             let workers = SCAN_WORKERS.min(total).max(1);
             let chunk = total.div_ceil(workers);
-            let done = Arc::new(AtomicUsize::new(0));
-            let python = Arc::new(python);
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
             let mut handles = Vec::with_capacity(workers);
-            for c in managed.chunks(chunk) {
-                let mine: Vec<Extension> = c.to_vec();
+            for entries in managed.chunks(chunk) {
+                let entries = entries.to_vec();
                 let env = env_vars.clone();
-                let done = done.clone();
-                let progress_tx = tx.clone();
-                let python = python.clone();
+                let result_tx = result_tx.clone();
                 handles.push(std::thread::spawn(move || {
-                    for ext in mine {
-                        sync_to_upstream(&ext.path, &env);
-                        if !python.is_empty() {
-                            let _ = pip::install_requirements(
-                                std::path::Path::new(python.as_str()),
-                                &ext.path,
-                                env.clone(),
-                            );
-                        }
-                        let now = done.fetch_add(1, Ordering::SeqCst) + 1;
-                        let _ = progress_tx.send(TaskResult::Progress { done: now, total });
+                    for ext in entries {
+                        let result = sync_to_upstream(&ext.path, &env).map_err(|e| e.to_string());
+                        let _ = result_tx.send((ext, result));
                     }
                 }));
             }
-            for h in handles {
-                let _ = h.join();
+            drop(result_tx);
+
+            let results: Vec<(Extension, Result<(), String>)> = result_rx.iter().collect();
+            for handle in handles {
+                let _ = handle.join();
+            }
+
+            let mut failures = Vec::new();
+            let mut synced = Vec::new();
+            for (ext, result) in results {
+                match result {
+                    Ok(()) => synced.push(ext),
+                    Err(message) => {
+                        failures.push(super::ItemFailure::new(ext.name, "git sync", message))
+                    }
+                }
+            }
+            let changed_any = !synced.is_empty();
+            let failed_count = total.saturating_sub(synced.len());
+            if failed_count > 0 {
+                let _ = tx.send(TaskResult::Progress {
+                    done: failed_count,
+                    total,
+                });
+            }
+
+            // Intentionally sequential: concurrent pip processes are unsafe
+            // against one shared site-packages directory on every platform.
+            for (index, ext) in synced.into_iter().enumerate() {
+                if !python.is_empty() {
+                    let pip_ok = pip::install_requirements(
+                        std::path::Path::new(&python),
+                        &ext.path,
+                        env_vars.clone(),
+                    )
+                    .unwrap_or(false);
+                    if !pip_ok {
+                        failures.push(super::ItemFailure::new(
+                            ext.name,
+                            "pip install",
+                            "source changed, but dependency installation failed; see the task log",
+                        ));
+                    }
+                }
+                let done = failed_count + index + 1;
+                let _ = tx.send(TaskResult::Progress { done, total });
+            }
+
+            // Publish actual local state before the follow-up remote refresh.
+            let refreshed = scan_local(&root, super::LIST_MAX_NUM);
+            let _ = tx.send(TaskResult::ExtData {
+                items: refreshed,
+                root,
+                requested_limit: super::LIST_MAX_NUM,
+            });
+
+            if failures.is_empty() {
+                super::TaskOutcome::Success
+            } else if changed_any {
+                super::TaskOutcome::PartialFailure(failures)
+            } else {
+                super::TaskOutcome::Failure(failures)
             }
         }),
     }
@@ -1588,6 +1606,7 @@ fn list_versions_request_n(
         title,
         then: TaskKind::None,
         is_refresh: false,
+        changes_repository: false,
         work: Box::new(move |tx| {
             let _ = git::fetch(&path, env_vars.clone());
             let _ = git::deepen_until_full(&path, env_vars);
@@ -1599,6 +1618,7 @@ fn list_versions_request_n(
                 current,
                 requested_limit: limit,
             });
+            super::TaskOutcome::Success
         }),
     }
 }
@@ -1616,26 +1636,58 @@ fn checkout_ext_request(
         title,
         then: TaskKind::None,
         is_refresh: false,
+        changes_repository: true,
         work: Box::new(move |tx| {
-            let ok = git::checkout(&path, &rev, env_vars.clone()).unwrap_or(false);
-            // Verify the HEAD actually moved so a silent failure shows up in
-            // the popup tail instead of looking like nothing happened.
-            if let Some(head) = git::current_commit(&path) {
-                if !head.starts_with(&rev) && !rev.starts_with(&head) {
-                    crate::core::log_bus::push(
-                        "git",
-                        format!("checkout did not reach {rev}; HEAD is still {head}"),
-                    );
-                }
+            if !git::checkout(&path, &rev, env_vars.clone()).unwrap_or(false) {
+                return super::TaskOutcome::failure(
+                    &name,
+                    "git checkout",
+                    "checkout failed; dependency installation was skipped; see the task log",
+                );
             }
-            if ok && !python.is_empty() {
-                let _ = pip::install_requirements(std::path::Path::new(&python), &path, env_vars);
+
+            let mut failures = Vec::new();
+            match git::current_commit(&path) {
+                Some(head) if !head.starts_with(&rev) && !rev.starts_with(&head) => {
+                    failures.push(super::ItemFailure::new(
+                        &name,
+                        "verify checkout",
+                        format!("requested {rev}, but HEAD is {head}"),
+                    ));
+                }
+                None => failures.push(super::ItemFailure::new(
+                    &name,
+                    "verify checkout",
+                    "checkout succeeded, but HEAD could not be read",
+                )),
+                _ => {}
+            }
+            if !python.is_empty()
+                && !pip::install_requirements(std::path::Path::new(&python), &path, env_vars)
+                    .unwrap_or(false)
+            {
+                failures.push(super::ItemFailure::new(
+                    &name,
+                    "pip install",
+                    "source changed, but dependency installation failed; see the task log",
+                ));
             }
             if let Some(ext) = read_one_local(&path) {
                 let _ = tx.send(TaskResult::ExtRowUpdate {
                     old_path: path,
                     ext,
                 });
+            } else {
+                failures.push(super::ItemFailure::new(
+                    &name,
+                    "read state",
+                    "repository changed, but its new state could not be read",
+                ));
+            }
+            if failures.is_empty() {
+                super::TaskOutcome::Success
+            } else {
+                super::TaskOutcome::PartialFailure(failures)
             }
         }),
     }
@@ -1647,9 +1699,13 @@ fn uninstall_request(path: PathBuf, _root: PathBuf, name: String) -> TaskRequest
         title,
         then: TaskKind::None,
         is_refresh: false,
+        changes_repository: true,
         work: Box::new(move |tx| {
-            let _ = std::fs::remove_dir_all(&path);
+            if let Err(e) = std::fs::remove_dir_all(&path) {
+                return super::TaskOutcome::failure(&name, "uninstall", e.to_string());
+            }
             let _ = tx.send(TaskResult::ExtRowRemove { path });
+            super::TaskOutcome::Success
         }),
     }
 }
@@ -1671,6 +1727,7 @@ fn toggle_enabled_request(
         title,
         then: TaskKind::None,
         is_refresh: false,
+        changes_repository: true,
         work: Box::new(move |tx| {
             let new_path = if currently_disabled {
                 // Strip trailing ".disabled"
@@ -1683,13 +1740,20 @@ fn toggle_enabled_request(
             };
             if let Err(e) = std::fs::rename(&path, &new_path) {
                 crate::core::log_bus::push("ext", format!("rename failed: {e}"));
-                return;
+                return super::TaskOutcome::failure(name, "rename", e.to_string());
             }
             if let Some(ext) = read_one_local(&new_path) {
                 let _ = tx.send(TaskResult::ExtRowUpdate {
                     old_path: path,
                     ext,
                 });
+                super::TaskOutcome::Success
+            } else {
+                super::TaskOutcome::PartialFailure(vec![super::ItemFailure::new(
+                    &name,
+                    "read state",
+                    "extension was renamed, but its new state could not be read",
+                )])
             }
         }),
     }
@@ -1714,48 +1778,65 @@ fn reinstall_all_request(
     env_vars: std::collections::HashMap<String, String>,
     python: String,
 ) -> TaskRequest {
-    let then = TaskKind::ExtLoad(root);
-    TaskRequest {
-        title: i18n::t("task_ext_reinstall_all"),
-        then,
-        is_refresh: false,
-        work: Box::new(move |tx| {
-            use std::sync::{
-                atomic::{AtomicUsize, Ordering},
-                Arc,
-            };
-            let managed: Vec<Extension> = items.into_iter().filter(|e| e.managed).collect();
-            let total = managed.len();
-            let _ = tx.send(TaskResult::Progress { done: 0, total });
-            let workers = SCAN_WORKERS.min(total).max(1);
-            let chunk = total.div_ceil(workers);
-            let done = Arc::new(AtomicUsize::new(0));
-            let python = Arc::new(python);
-            let mut handles = Vec::with_capacity(workers);
-            for c in managed.chunks(chunk) {
-                let mine: Vec<Extension> = c.to_vec();
-                let env = env_vars.clone();
-                let done = done.clone();
-                let progress_tx = tx.clone();
-                let python = python.clone();
-                handles.push(std::thread::spawn(move || {
-                    for ext in mine {
-                        sync_to_upstream(&ext.path, &env);
-                        if !python.is_empty() {
-                            let _ = pip::install_requirements(
-                                std::path::Path::new(python.as_str()),
-                                &ext.path,
-                                env.clone(),
-                            );
-                        }
-                        let now = done.fetch_add(1, Ordering::SeqCst) + 1;
-                        let _ = progress_tx.send(TaskResult::Progress { done: now, total });
-                    }
-                }));
-            }
-            for h in handles {
-                let _ = h.join();
-            }
-        }),
+    bulk_sync_request(
+        i18n::t("task_ext_reinstall_all"),
+        items,
+        root,
+        env_vars,
+        python,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn extension(name: &str) -> Extension {
+        Extension {
+            name: name.into(),
+            path: PathBuf::from(name),
+            disabled: false,
+            managed: false,
+            remote: String::new(),
+            branch: String::new(),
+            head: String::new(),
+            head_date: String::new(),
+            behind: 0,
+        }
+    }
+
+    #[test]
+    fn page_down_works_after_page_up_focuses_search() {
+        let mut tab = ExtensionsTab::new();
+        tab.items = vec![extension("one"), extension("two"), extension("three")];
+        tab.visible_rows.set(2);
+
+        tab.on_key(KeyCode::PageUp, &Config::default());
+        assert_eq!((tab.grid.row(), tab.grid.col()), (0, 0));
+
+        tab.on_key(KeyCode::PageDown, &Config::default());
+        assert_eq!((tab.grid.row(), tab.grid.list_selected()), (1, 2));
+    }
+
+    #[test]
+    fn empty_extension_scan_completes_without_zero_sized_chunks() {
+        let root = std::env::temp_dir().join(format!(
+            "comfyui-tui-empty-ext-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let request = load_request_with_limit(root.clone(), 10, Default::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let outcome = (request.work)(tx);
+        assert!(matches!(outcome, super::super::TaskOutcome::Success));
+        assert!(rx.try_iter().any(|result| matches!(
+            result,
+            TaskResult::ExtData { items, .. } if items.is_empty()
+        )));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

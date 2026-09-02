@@ -75,6 +75,7 @@ fn get(cfg: &Config, key: &str) -> Value {
         "network.pypi_mirror" => Value::String(cfg.network.pypi_mirror.clone()),
         "network.git_mirror" => Value::String(cfg.network.git_mirror.clone()),
         "network.hf_mirror" => Value::String(cfg.network.hf_mirror.clone()),
+        "network.hf_force_mirror" => Value::Boolean(cfg.network.hf_force_mirror),
         "network.github_accel" => Value::String(cfg.network.github_accel.clone()),
         "general.crash_auto_restart" => Value::Boolean(cfg.general.crash_auto_restart),
         "general.crash_restart_delay_secs" => {
@@ -148,6 +149,13 @@ fn set(cfg: &mut Config, key: &str, v: Value) -> Result<(), String> {
             cfg.network.hf_mirror =
                 crate::core::env::normalize_semicolon_list(v.as_str().unwrap_or(""));
             let _ = cfg.save();
+            Ok(())
+        }
+        "network.hf_force_mirror" => {
+            if let Some(b) = v.as_bool() {
+                cfg.network.hf_force_mirror = b;
+                let _ = cfg.save();
+            }
             Ok(())
         }
         "network.github_accel" => {

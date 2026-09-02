@@ -46,8 +46,12 @@ impl FocusGrid {
     /// Sets the current list length. Call before navigation each frame.
     pub fn set_list_len(&mut self, len: usize) {
         self.list_len = len;
-        if self.in_list() && self.list_selected >= len && len > 0 {
+        if len == 0 {
+            self.list_selected = 0;
+            self.list_scroll = 0;
+        } else if self.list_selected >= len {
             self.list_selected = len - 1;
+            self.ensure_visible();
         }
     }
 
@@ -249,5 +253,42 @@ impl FocusGrid {
             self.list_selected = 0;
             self.list_scroll = 0;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_keys_share_the_two_row_focus_topology() {
+        let mut grid = FocusGrid::new(vec![RowKind::Fixed(3), RowKind::List]);
+        grid.set_list_len(8);
+        grid.set_visible_rows(3);
+        grid.set_focus(0, 2);
+
+        grid.move_down();
+        assert_eq!((grid.row(), grid.col(), grid.list_selected()), (1, 0, 0));
+        grid.page_up();
+        assert_eq!((grid.row(), grid.col()), (0, 2));
+        grid.page_down();
+        assert_eq!((grid.row(), grid.col(), grid.list_selected()), (1, 0, 7));
+        assert_eq!(grid.list_scroll(), 5);
+    }
+
+    #[test]
+    fn page_keys_share_the_three_row_focus_topology() {
+        let mut grid = FocusGrid::new(vec![RowKind::Fixed(2), RowKind::Fixed(1), RowKind::List]);
+        grid.set_list_len(5);
+        grid.set_focus(0, 1);
+
+        grid.move_down();
+        assert_eq!((grid.row(), grid.col()), (1, 0));
+        grid.move_down();
+        assert_eq!((grid.row(), grid.col(), grid.list_selected()), (2, 0, 0));
+        grid.page_up();
+        assert_eq!((grid.row(), grid.col()), (0, 1));
+        grid.page_down();
+        assert_eq!((grid.row(), grid.col(), grid.list_selected()), (2, 0, 4));
     }
 }

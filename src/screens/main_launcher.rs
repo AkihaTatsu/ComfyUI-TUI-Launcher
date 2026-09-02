@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use unicode_width::UnicodeWidthStr;
 
 /// One visible row in the scrollable info list.
+#[derive(Clone)]
 pub enum Row {
     /// Non-interactive section header.
     Header(String),
@@ -26,6 +27,19 @@ pub enum Row {
         /// Row value.
         value: String,
     },
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct InfoKey {
+    comfyui_dir: String,
+    python: String,
+    language: String,
+    launch_command: String,
+}
+
+struct InfoLoad {
+    key: InfoKey,
+    rows: Vec<Row>,
 }
 
 /// Action the application should perform after a Main Launcher interaction.
@@ -68,6 +82,14 @@ pub struct MainLauncher {
     pub btn_activate: Button,
     /// Launch ComfyUI button.
     pub btn_launch: Button,
+    /// Last fully collected information model. Rendering and navigation read
+    /// this vector only; all filesystem and child-process probes happen in a
+    /// background loader.
+    rows: Vec<Row>,
+    loaded_key: Option<InfoKey>,
+    load_rx: Option<std::sync::mpsc::Receiver<InfoLoad>>,
+    invalidated: bool,
+    was_active: bool,
 }
 
 impl MainLauncher {
@@ -82,7 +104,70 @@ impl MainLauncher {
             visible: Cell::new(0),
             btn_activate: Button::new(ButtonKind::Primary),
             btn_launch: Button::new(ButtonKind::Primary),
+            rows: vec![Row::Item {
+                label: i18n::t("section_comfy_info"),
+                value: i18n::t("popup_please_wait"),
+            }],
+            loaded_key: None,
+            load_rx: None,
+            invalidated: true,
+            was_active: false,
         }
+    }
+
+    fn info_key(cfg: &Config, schema: &Schema) -> InfoKey {
+        InfoKey {
+            comfyui_dir: cfg.general.comfyui_dir.clone(),
+            python: cfg.general.python.clone(),
+            language: cfg.general.language.clone(),
+            launch_command: Self::launch_command(cfg, schema),
+        }
+    }
+
+    /// Polls the current information loader and starts a new one when the
+    /// relevant configuration changed, a repository mutation invalidated the
+    /// snapshot, or the user returns to the main screen.
+    pub fn tick(&mut self, cfg: &Config, schema: &Schema, active: bool) -> bool {
+        let mut changed = false;
+        let wanted = Self::info_key(cfg, schema);
+        if let Some(rx) = self.load_rx.take() {
+            match rx.try_recv() {
+                Ok(load) => {
+                    if load.key == wanted {
+                        self.rows = load.rows;
+                        self.loaded_key = Some(load.key);
+                        changed = true;
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.load_rx = Some(rx);
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+            }
+        }
+
+        let screen_entered = active && !self.was_active;
+        self.was_active = active;
+        let key_changed = self.loaded_key.as_ref() != Some(&wanted);
+        if self.load_rx.is_none() && (self.invalidated || key_changed || screen_entered) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let cfg = cfg.clone();
+            let schema = schema.clone();
+            let key = wanted;
+            std::thread::spawn(move || {
+                let rows = Self::build_rows(&cfg, &schema);
+                let _ = tx.send(InfoLoad { key, rows });
+            });
+            self.load_rx = Some(rx);
+            self.invalidated = false;
+        }
+        changed
+    }
+
+    /// Requests a fresh snapshot after a version task changes repository
+    /// state. If a loader is already active, one more pass starts afterwards.
+    pub fn invalidate_info(&mut self) {
+        self.invalidated = true;
     }
 
     /// Returns the current focus as a `MainFocus` enum for external use.
@@ -228,9 +313,8 @@ impl MainLauncher {
     /// `[scroll, scroll + height)`. Takes `&self` because `scroll` is a
     /// `Cell` — this is also called from `render(&self)` so the selected
     /// row stays visible even after a terminal resize or row list change.
-    fn ensure_visible(&self, cfg: &Config, schema: &Schema) {
-        let rows = Self::build_rows(cfg, schema);
-        let items = Self::item_indices(&rows);
+    fn ensure_visible(&self) {
+        let items = Self::item_indices(&self.rows);
         if items.is_empty() {
             self.scroll.set(0);
             return;
@@ -249,7 +333,7 @@ impl MainLauncher {
             s = max_off;
         }
         // Don't scroll past the end of the list.
-        let max_scroll = rows.len().saturating_sub(v);
+        let max_scroll = self.rows.len().saturating_sub(v);
         if s > max_scroll {
             s = max_scroll;
         }
@@ -281,14 +365,7 @@ impl MainLauncher {
     }
 
     /// Renders the screen into `area`.
-    pub fn render(
-        &self,
-        f: &mut Frame,
-        area: Rect,
-        cfg: &Config,
-        schema: &Schema,
-        body_active: bool,
-    ) {
+    pub fn render(&self, f: &mut Frame, area: Rect, body_active: bool) {
         let (list_area, act_rect, launch_rect, _btn_row) = Self::split(area);
 
         // The list title in the top border doubles as a hint that
@@ -307,14 +384,14 @@ impl MainLauncher {
         };
         self.visible.set(inner.height as usize);
 
-        let rows = Self::build_rows(cfg, schema);
-        let items = Self::item_indices(&rows);
+        let rows = &self.rows;
+        let items = Self::item_indices(rows);
         let selected_data = self.grid.list_selected().min(items.len().saturating_sub(1));
         let selected_row_idx = items.get(selected_data).copied().unwrap_or(usize::MAX);
         let list_active = body_active && self.grid.row() == 0;
         // Re-clamp scroll so the selected row stays visible after a
         // terminal resize or row-list change.
-        self.ensure_visible(cfg, schema);
+        self.ensure_visible();
 
         let start = self.scroll.get().min(rows.len().saturating_sub(1));
         let end = (start + inner.height as usize).min(rows.len());
@@ -369,44 +446,44 @@ impl MainLauncher {
     }
     /// Moves the cursor up through the list, or back to the list from the
     /// button row.
-    pub fn up(&mut self, cfg: &Config, schema: &Schema) {
-        let items_len = Self::item_indices(&Self::build_rows(cfg, schema)).len();
+    pub fn up(&mut self) {
+        let items_len = Self::item_indices(&self.rows).len();
         self.grid.set_list_len(items_len);
         self.grid.set_visible_rows(self.visible.get());
         self.grid.move_up();
-        self.ensure_visible(cfg, schema);
+        self.ensure_visible();
     }
     /// Moves the cursor down through the list, or from the list to the
     /// button row.
-    pub fn down(&mut self, cfg: &Config, schema: &Schema) {
-        let items_len = Self::item_indices(&Self::build_rows(cfg, schema)).len();
+    pub fn down(&mut self) {
+        let items_len = Self::item_indices(&self.rows).len();
         self.grid.set_list_len(items_len);
         self.grid.set_visible_rows(self.visible.get());
         self.grid.move_down();
-        self.ensure_visible(cfg, schema);
+        self.ensure_visible();
     }
 
     /// Jumps to the first row (list).
-    pub fn page_up(&mut self, cfg: &Config, schema: &Schema) {
-        let items_len = Self::item_indices(&Self::build_rows(cfg, schema)).len();
+    pub fn page_up(&mut self) {
+        let items_len = Self::item_indices(&self.rows).len();
         self.grid.set_list_len(items_len);
         self.grid.page_up();
-        self.ensure_visible(cfg, schema);
+        self.ensure_visible();
     }
 
     /// Jumps to the last row (button row).
-    pub fn page_down(&mut self, _cfg: &Config, _schema: &Schema) {
+    pub fn page_down(&mut self) {
         self.grid.page_down();
     }
 
     /// Handles a wheel-scroll event, cycling through list rows and the
     /// button row.
-    pub fn scroll(&mut self, delta: i32, cfg: &Config, schema: &Schema) {
-        let items_len = Self::item_indices(&Self::build_rows(cfg, schema)).len();
+    pub fn scroll(&mut self, delta: i32) {
+        let items_len = Self::item_indices(&self.rows).len();
         self.grid.set_list_len(items_len);
         self.grid.set_visible_rows(self.visible.get());
         self.grid.scroll(delta);
-        self.ensure_visible(cfg, schema);
+        self.ensure_visible();
     }
 
     /// Handles a mouse event.
@@ -415,7 +492,6 @@ impl MainLauncher {
         m: crossterm::event::MouseEvent,
         area: Rect,
         cfg: &Config,
-        schema: &Schema,
     ) -> MainAction {
         let (list_area, act_rect, launch_rect, _) = Self::split(area);
         let inside = |r: Rect| {
@@ -440,8 +516,8 @@ impl MainLauncher {
         }
 
         // Translate click into a data-row index via the visible window.
-        let rows = Self::build_rows(cfg, schema);
-        let items = Self::item_indices(&rows);
+        let rows = &self.rows;
+        let items = Self::item_indices(rows);
         let inner_top = list_area.y + 1;
         if m.row < inner_top {
             return MainAction::None;
@@ -459,32 +535,31 @@ impl MainLauncher {
         self.grid.set_focus(0, 0);
         self.grid.set_list_selected(data_idx);
         if data_idx != prev_selected {
-            self.ensure_visible(cfg, schema);
+            self.ensure_visible();
             return MainAction::None;
         }
         // A second click on the same row copies its value.
-        self.activate(cfg, schema)
+        self.activate(cfg)
     }
 
     /// Activates the focused control.
     ///
     /// List rows copy their value; the buttons return the matching
     /// `MainAction`.
-    pub fn activate(&mut self, cfg: &Config, schema: &Schema) -> MainAction {
+    pub fn activate(&mut self, cfg: &Config) -> MainAction {
         match self.focus() {
-            MainFocus::List => self.copy_selected(cfg, schema),
+            MainFocus::List => self.copy_selected(),
             MainFocus::Activate => self.activate_venv(cfg),
             MainFocus::Launch => MainAction::Launch,
         }
     }
 
-    fn copy_selected(&mut self, cfg: &Config, schema: &Schema) -> MainAction {
-        let rows = Self::build_rows(cfg, schema);
-        let items = Self::item_indices(&rows);
+    fn copy_selected(&mut self) -> MainAction {
+        let items = Self::item_indices(&self.rows);
         let Some(&abs) = items.get(self.grid.list_selected()) else {
             return MainAction::None;
         };
-        if let Row::Item { value, .. } = &rows[abs] {
+        if let Row::Item { value, .. } = &self.rows[abs] {
             match clipboard::copy(value) {
                 Ok(()) => MainAction::Flash(FlashKind::Info, i18n::t("popup_copied")),
                 Err(e) => MainAction::Flash(

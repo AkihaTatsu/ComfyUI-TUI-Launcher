@@ -65,6 +65,14 @@ cli = ""
 default = ""
 
 [[tab.field]]
+key = "network.hf_force_mirror"
+name = "setting_hf_force_mirror"
+desc = "setting_hf_force_mirror_desc"
+type = "toggle"
+cli = ""
+default = false
+
+[[tab.field]]
 key = "network.github_accel"
 name = "setting_github_accel"
 desc = "setting_github_accel_desc"

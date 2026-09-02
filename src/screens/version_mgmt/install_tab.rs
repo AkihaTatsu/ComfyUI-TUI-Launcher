@@ -10,6 +10,7 @@ use crate::core::extension_registry::{self, InstallStatus, RegistryEntry};
 use crate::core::paths::ComfyDirs;
 use crate::core::{clipboard, env, git, i18n, opener, pip};
 use crate::widgets::button::{Button, ButtonKind};
+use crate::widgets::focus_grid::{FocusGrid, RowKind};
 use crate::widgets::input::Input;
 use crate::widgets::popup;
 use crate::widgets::popup::notice::{Notice, NoticeCopy, NoticeOutcome};
@@ -51,35 +52,18 @@ impl InstallActionsMenu {
     }
 }
 
-/// Which control on the Install tab currently holds focus.
-#[derive(Copy, Clone, PartialEq, Eq)]
-pub enum InstallFocus {
-    /// URL input.
-    Url,
-    /// Install button next to the URL input.
-    InstallBtn,
-    /// Search input above the catalog.
-    Search,
-    /// Catalog table.
-    Catalog,
-}
-
 /// Install New extensions tab state.
 pub struct InstallTab {
     /// URL input.
     pub url: Input,
     /// Search input filtering the catalog.
     pub search: Input,
-    /// Currently focused control.
-    pub focus: InstallFocus,
+    /// Shared focus and catalog-selection state for the three-row layout.
+    pub grid: FocusGrid,
     /// Cached catalog entries.
     pub catalog: Vec<RegistryEntry>,
     /// Whether `catalog` has been loaded.
     pub catalog_loaded: bool,
-    /// Selected catalog row.
-    pub catalog_selected: usize,
-    /// Catalog scroll offset.
-    pub catalog_scroll: usize,
     /// Number of catalog rows displayed per frame.
     pub catalog_visible_rows: Cell<usize>,
     /// Actions popup for the selected catalog entry.
@@ -90,9 +74,6 @@ pub struct InstallTab {
     pub pending_flash: Option<(FlashKind, String)>,
     /// Persistent Install button next to the URL input.
     pub btn_install: Button,
-    /// Last focused column in row 0 (Url or InstallBtn), restored when
-    /// navigating back to row 0 from another row.
-    pub last_row0_col: InstallFocus,
 }
 
 impl InstallTab {
@@ -103,7 +84,7 @@ impl InstallTab {
 
     /// Whether any text input widget currently has keyboard focus.
     pub fn text_input_focused(&self) -> bool {
-        matches!(self.focus, InstallFocus::Url | InstallFocus::Search)
+        (self.grid.row() == 0 && self.grid.col() == 0) || self.grid.row() == 1
     }
 
     fn copy_to_clipboard(&mut self, s: String) {
@@ -118,20 +99,19 @@ impl InstallTab {
             Some(v) => (v, true),
             None => (Vec::new(), false),
         };
+        let mut grid = FocusGrid::new(vec![RowKind::Fixed(2), RowKind::Fixed(1), RowKind::List]);
+        grid.set_focus(2, 0);
         Self {
             url: Input::default().placeholder("placeholder_install_url"),
             search: Input::default().placeholder("placeholder_search"),
-            focus: InstallFocus::Catalog,
+            grid,
             catalog,
             catalog_loaded: loaded,
-            catalog_selected: 0,
-            catalog_scroll: 0,
             catalog_visible_rows: Cell::new(0),
             actions_menu: None,
             notice: None,
             pending_flash: None,
             btn_install: Button::new(ButtonKind::Primary),
-            last_row0_col: InstallFocus::Url,
         }
     }
 
@@ -161,17 +141,10 @@ impl InstallTab {
 
     /// Clamps the catalog scroll offset so the selected row is visible.
     pub fn ensure_visible(&mut self) {
-        let v = self.catalog_visible_rows.get().max(1);
-        if self.catalog_selected < self.catalog_scroll {
-            self.catalog_scroll = self.catalog_selected;
-        }
-        let max_off = self.catalog_selected.saturating_sub(v - 1);
-        if self.catalog_scroll < max_off {
-            self.catalog_scroll = max_off;
-        }
-        if self.catalog_scroll > self.catalog_selected {
-            self.catalog_scroll = self.catalog_selected;
-        }
+        self.grid.set_list_len(self.filtered().len());
+        self.grid
+            .set_visible_rows(self.catalog_visible_rows.get().max(1));
+        self.grid.ensure_visible();
     }
 
     /// Filters catalog rows using a case-insensitive substring match on
@@ -228,18 +201,20 @@ impl InstallTab {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(0), Constraint::Length(install_w)])
             .split(v[0]);
-        self.url
-            .render(f, url_h[0], self.focus == InstallFocus::Url && active);
+        self.url.render(
+            f,
+            url_h[0],
+            self.grid.row() == 0 && self.grid.col() == 0 && active,
+        );
         self.btn_install.render(
             f,
             url_h[1],
             &i18n::t("btn_install"),
-            self.focus == InstallFocus::InstallBtn && active,
+            self.grid.row() == 0 && self.grid.col() == 1 && active,
         );
 
         // Search
-        self.search
-            .render(f, v[1], self.focus == InstallFocus::Search && active);
+        self.search.render(f, v[1], self.grid.row() == 1 && active);
 
         // Catalog
         self.catalog_visible_rows
@@ -269,8 +244,8 @@ impl InstallTab {
         Table {
             columns: &cols,
             row_count: filtered.len(),
-            selected: self.catalog_selected,
-            scroll: self.catalog_scroll,
+            selected: self.grid.list_selected(),
+            scroll: self.grid.list_scroll(),
         }
         .render(
             f,
@@ -284,7 +259,7 @@ impl InstallTab {
                     e.description.clone(),
                 ]
             },
-            active && self.focus == InstallFocus::Catalog,
+            active && self.grid.row() == 2,
         );
 
         if let Some(am) = &self.actions_menu {
@@ -312,53 +287,29 @@ impl InstallTab {
     /// Attempts to handle a Left arrow within this tab.
     /// Returns `true` if the key was consumed.
     pub fn on_left(&mut self) -> bool {
-        match self.focus {
-            InstallFocus::Url => {
-                if !self.url.at_start() {
-                    self.url.on_key(KeyCode::Left);
-                    return true;
-                }
-                false // propagate
-            }
-            InstallFocus::InstallBtn => {
-                self.focus = InstallFocus::Url;
-                self.last_row0_col = InstallFocus::Url;
-                true
-            }
-            InstallFocus::Search => {
-                if !self.search.at_start() {
-                    self.search.on_key(KeyCode::Left);
-                    return true;
-                }
-                false
-            }
-            InstallFocus::Catalog => false,
+        if self.grid.row() == 0 && self.grid.col() == 0 && !self.url.at_start() {
+            self.url.on_key(KeyCode::Left);
+            return true;
         }
+        if self.grid.row() == 1 && !self.search.at_start() {
+            self.search.on_key(KeyCode::Left);
+            return true;
+        }
+        self.grid.move_left()
     }
 
     /// Attempts to handle a Right arrow within this tab.
     /// Returns `true` if the key was consumed.
     pub fn on_right(&mut self) -> bool {
-        match self.focus {
-            InstallFocus::Url => {
-                if !self.url.at_end() {
-                    self.url.on_key(KeyCode::Right);
-                    return true;
-                }
-                self.focus = InstallFocus::InstallBtn;
-                self.last_row0_col = InstallFocus::InstallBtn;
-                true
-            }
-            InstallFocus::InstallBtn => false, // propagate
-            InstallFocus::Search => {
-                if !self.search.at_end() {
-                    self.search.on_key(KeyCode::Right);
-                    return true;
-                }
-                false
-            }
-            InstallFocus::Catalog => false,
+        if self.grid.row() == 0 && self.grid.col() == 0 && !self.url.at_end() {
+            self.url.on_key(KeyCode::Right);
+            return true;
         }
+        if self.grid.row() == 1 && !self.search.at_end() {
+            self.search.on_key(KeyCode::Right);
+            return true;
+        }
+        self.grid.move_right()
     }
 
     /// Handles a key event.
@@ -420,157 +371,76 @@ impl InstallTab {
                 _ => return None,
             }
         }
-        // Text inputs intercept printable / nav keys when focused.
-        match self.focus {
-            InstallFocus::Url => match code {
-                KeyCode::Tab => {
-                    self.focus = InstallFocus::InstallBtn;
-                    return None;
-                }
-                KeyCode::Enter => {
-                    return self.do_url_install(cfg);
-                }
-                KeyCode::Down => {
-                    self.focus = InstallFocus::Search;
-                    return None;
-                }
-                KeyCode::Up => {
-                    let n = self.filtered().len();
-                    if n > 0 {
-                        self.focus = InstallFocus::Catalog;
-                        self.catalog_selected = n - 1;
-                        self.ensure_visible();
-                    } else {
-                        self.focus = InstallFocus::Search;
-                    }
-                    return None;
-                }
-                k if !matches!(k, KeyCode::Left | KeyCode::Right) => {
-                    self.url.on_key(k);
-                    return None;
-                }
-                _ => {
-                    return None;
-                }
+        let n = self.filtered().len();
+        self.grid.set_list_len(n);
+        self.grid
+            .set_visible_rows(self.catalog_visible_rows.get().max(1));
+
+        // Page keys navigate the same page topology as the arrow keys.  Keep
+        // this ahead of text-input handling so Input cannot swallow them.
+        match code {
+            KeyCode::PageUp => {
+                self.grid.page_up();
+                return None;
+            }
+            KeyCode::PageDown => {
+                self.grid.page_down();
+                return None;
+            }
+            _ => {}
+        }
+
+        // Text inputs intercept editing keys only after page navigation.
+        match (self.grid.row(), self.grid.col()) {
+            (0, 0) => match code {
+                KeyCode::Tab => self.grid.set_focus(0, 1),
+                KeyCode::BackTab => self.grid.set_focus(2, 0),
+                KeyCode::Enter => return self.do_url_install(cfg),
+                KeyCode::Up => self.grid.move_up(),
+                KeyCode::Down => self.grid.move_down(),
+                k if !matches!(k, KeyCode::Left | KeyCode::Right) => self.url.on_key(k),
+                _ => {}
             },
-            InstallFocus::InstallBtn => match code {
-                KeyCode::Enter => {
-                    return self.do_url_install(cfg);
-                }
-                KeyCode::Down => {
-                    self.focus = InstallFocus::Search;
-                    return None;
-                }
-                KeyCode::Up => {
-                    let n = self.filtered().len();
-                    if n > 0 {
-                        self.focus = InstallFocus::Catalog;
-                        self.catalog_selected = n - 1;
-                        self.ensure_visible();
-                    } else {
-                        self.focus = InstallFocus::Search;
-                    }
-                    return None;
-                }
-                _ => {
-                    return None;
-                }
+            (0, 1) => match code {
+                KeyCode::Tab => self.grid.set_focus(1, 0),
+                KeyCode::BackTab => self.grid.set_focus(0, 0),
+                KeyCode::Enter => return self.do_url_install(cfg),
+                KeyCode::Up => self.grid.move_up(),
+                KeyCode::Down => self.grid.move_down(),
+                _ => {}
             },
-            InstallFocus::Search => match code {
-                KeyCode::Tab => {
-                    self.focus = InstallFocus::Catalog;
-                    return None;
+            (1, _) => match code {
+                KeyCode::Tab => self.grid.set_focus(2, 0),
+                KeyCode::Enter => {
+                    self.grid.set_focus(2, 0);
+                    self.grid.set_list_selected(0);
+                    self.grid.set_list_scroll(0);
                 }
-                KeyCode::Enter | KeyCode::Down => {
-                    self.focus = InstallFocus::Catalog;
-                    self.catalog_selected = 0;
-                    self.catalog_scroll = 0;
-                    return None;
-                }
-                KeyCode::Up => {
-                    self.focus = self.last_row0_col;
-                    return None;
-                }
+                KeyCode::BackTab => self.grid.set_focus(0, 1),
+                KeyCode::Up => self.grid.move_up(),
+                KeyCode::Down => self.grid.move_down(),
                 k if !matches!(k, KeyCode::Left | KeyCode::Right) => {
                     self.search.on_key(k);
-                    self.catalog_selected = 0;
-                    self.catalog_scroll = 0;
-                    return None;
+                    self.grid.set_list_selected(0);
+                    self.grid.set_list_scroll(0);
                 }
-                _ => {
-                    return None;
+                _ => {}
+            },
+            (2, _) => match code {
+                KeyCode::Tab => self.grid.set_focus(0, 0),
+                KeyCode::BackTab => self.grid.set_focus(1, 0),
+                KeyCode::Up if n > 0 => self.grid.move_up(),
+                KeyCode::Down if n > 0 => self.grid.move_down(),
+                KeyCode::Enter => return self.do_catalog_install(cfg, installed),
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    let env_vars = env::build(&cfg.network);
+                    return Some(fetch_registry_request(env_vars));
                 }
+                _ => {}
             },
             _ => {}
         }
-        match code {
-            KeyCode::Tab => {
-                self.focus = match self.focus {
-                    InstallFocus::Url => InstallFocus::InstallBtn,
-                    InstallFocus::InstallBtn => InstallFocus::Search,
-                    InstallFocus::Search => InstallFocus::Catalog,
-                    InstallFocus::Catalog => InstallFocus::Url,
-                };
-                None
-            }
-            KeyCode::BackTab => {
-                self.focus = match self.focus {
-                    InstallFocus::Url => InstallFocus::Catalog,
-                    InstallFocus::InstallBtn => InstallFocus::Url,
-                    InstallFocus::Search => InstallFocus::InstallBtn,
-                    InstallFocus::Catalog => InstallFocus::Search,
-                };
-                None
-            }
-            KeyCode::Up if self.focus == InstallFocus::Catalog => {
-                let filtered = self.filtered();
-                if filtered.is_empty() {
-                    return None;
-                }
-                if self.catalog_selected == 0 {
-                    self.focus = InstallFocus::Search;
-                } else {
-                    self.catalog_selected -= 1;
-                }
-                self.ensure_visible();
-                None
-            }
-            KeyCode::Down if self.focus == InstallFocus::Catalog => {
-                let filtered = self.filtered();
-                if filtered.is_empty() {
-                    return None;
-                }
-                if self.catalog_selected + 1 >= filtered.len() {
-                    self.focus = self.last_row0_col;
-                } else {
-                    self.catalog_selected += 1;
-                }
-                self.ensure_visible();
-                None
-            }
-            KeyCode::Enter if self.focus == InstallFocus::InstallBtn => self.do_url_install(cfg),
-            KeyCode::Enter if self.focus == InstallFocus::Catalog => {
-                self.do_catalog_install(cfg, installed)
-            }
-            KeyCode::PageUp => {
-                self.focus = self.last_row0_col;
-                None
-            }
-            KeyCode::PageDown => {
-                let n = self.filtered().len();
-                if n > 0 {
-                    self.focus = InstallFocus::Catalog;
-                    self.catalog_selected = n - 1;
-                    self.ensure_visible();
-                }
-                None
-            }
-            KeyCode::Char('r') | KeyCode::Char('R') => {
-                let env_vars = env::build(&cfg.network);
-                Some(fetch_registry_request(env_vars))
-            }
-            _ => None,
-        }
+        None
     }
 
     /// Handles a mouse event.
@@ -651,18 +521,16 @@ impl InstallTab {
         };
 
         if inside(url_h[1]) {
-            self.focus = InstallFocus::InstallBtn;
-            self.last_row0_col = InstallFocus::InstallBtn;
+            self.grid.set_focus(0, 1);
             self.btn_install.click();
             return None;
         }
         if inside(url_h[0]) {
-            self.focus = InstallFocus::Url;
-            self.last_row0_col = InstallFocus::Url;
+            self.grid.set_focus(0, 0);
             return None;
         }
         if inside(v[1]) {
-            self.focus = InstallFocus::Search;
+            self.grid.set_focus(1, 0);
             return None;
         }
         if !inside(v[2]) {
@@ -675,13 +543,13 @@ impl InstallTab {
         }
         let rel = (m.row - (v[2].y + 2)) as usize;
         let filtered = self.filtered();
-        let idx = self.catalog_scroll + rel;
+        let idx = self.grid.list_scroll() + rel;
         if idx >= filtered.len() {
             return None;
         }
-        if self.focus != InstallFocus::Catalog || idx != self.catalog_selected {
-            self.focus = InstallFocus::Catalog;
-            self.catalog_selected = idx;
+        if self.grid.row() != 2 || idx != self.grid.list_selected() {
+            self.grid.set_focus(2, 0);
+            self.grid.set_list_selected(idx);
             self.ensure_visible();
             return None;
         }
@@ -691,49 +559,10 @@ impl InstallTab {
     /// Handles a wheel-scroll event on the catalog.
     pub fn scroll(&mut self, delta: i32) {
         let n = self.filtered().len();
-        if delta < 0 {
-            match self.focus {
-                InstallFocus::Url | InstallFocus::InstallBtn => {
-                    if n > 0 {
-                        self.focus = InstallFocus::Catalog;
-                        self.catalog_selected = n - 1;
-                    } else {
-                        self.focus = InstallFocus::Search;
-                    }
-                }
-                InstallFocus::Search => {
-                    self.focus = self.last_row0_col;
-                }
-                InstallFocus::Catalog if self.catalog_selected == 0 => {
-                    self.focus = InstallFocus::Search;
-                }
-                InstallFocus::Catalog => {
-                    self.catalog_selected -= 1;
-                }
-            }
-        } else {
-            match self.focus {
-                InstallFocus::Url | InstallFocus::InstallBtn => {
-                    self.focus = InstallFocus::Search;
-                }
-                InstallFocus::Search => {
-                    if n > 0 {
-                        self.focus = InstallFocus::Catalog;
-                        self.catalog_selected = 0;
-                        self.catalog_scroll = 0;
-                    } else {
-                        self.focus = self.last_row0_col;
-                    }
-                }
-                InstallFocus::Catalog if self.catalog_selected + 1 >= n => {
-                    self.focus = self.last_row0_col;
-                }
-                InstallFocus::Catalog => {
-                    self.catalog_selected += 1;
-                }
-            }
-        }
-        self.ensure_visible();
+        self.grid.set_list_len(n);
+        self.grid
+            .set_visible_rows(self.catalog_visible_rows.get().max(1));
+        self.grid.scroll(delta);
     }
 
     fn do_url_install(&mut self, cfg: &Config) -> Option<TaskRequest> {
@@ -766,7 +595,7 @@ impl InstallTab {
         installed: &[super::extensions_tab::Extension],
     ) -> Option<TaskRequest> {
         let filtered = self.filtered();
-        let entry = filtered.get(self.catalog_selected)?;
+        let entry = filtered.get(self.grid.list_selected())?;
         let st = extension_registry::status_for(entry, installed);
         let is_installed = !matches!(st, InstallStatus::NotInstalled);
         // For an installed entry, find the local path by URL match (same
@@ -855,13 +684,39 @@ fn install_request(
         title,
         then: TaskKind::None,
         is_refresh: false,
+        changes_repository: true,
         work: Box::new(move |tx| {
-            let _ = git::clone(&url, &dest, env_vars.clone());
-            if !python.is_empty() {
-                let _ = pip::install_requirements(std::path::Path::new(&python), &dest, env_vars);
+            if !git::clone(&url, &dest, env_vars.clone()).unwrap_or(false) {
+                return super::TaskOutcome::failure(
+                    &url,
+                    "git clone",
+                    "clone failed; dependency installation was skipped; see the task log",
+                );
+            }
+            let mut failures = Vec::new();
+            if !python.is_empty()
+                && !pip::install_requirements(std::path::Path::new(&python), &dest, env_vars)
+                    .unwrap_or(false)
+            {
+                failures.push(super::ItemFailure::new(
+                    &url,
+                    "pip install",
+                    "extension was cloned, but dependency installation failed; see the task log",
+                ));
             }
             if let Some(ext) = super::extensions_tab::read_one_local(&dest) {
                 let _ = tx.send(TaskResult::ExtRowAdd { ext });
+            } else {
+                failures.push(super::ItemFailure::new(
+                    &url,
+                    "read state",
+                    "extension was cloned, but its state could not be read",
+                ));
+            }
+            if failures.is_empty() {
+                super::TaskOutcome::Success
+            } else {
+                super::TaskOutcome::PartialFailure(failures)
             }
         }),
     }
@@ -874,8 +729,9 @@ pub fn fetch_registry_request(env_vars: std::collections::HashMap<String, String
         title: i18n::t("task_registry_fetch"),
         then: TaskKind::None,
         is_refresh: true,
-        work: Box::new(
-            move |tx| match extension_registry::fetch_blocking(&env_vars) {
+        changes_repository: false,
+        work: Box::new(move |tx| {
+            match extension_registry::fetch_blocking(&env_vars) {
                 Ok(entries) => {
                     extension_registry::save_cache(&entries);
                     let _ = tx.send(TaskResult::RegistryData { entries });
@@ -884,10 +740,17 @@ pub fn fetch_registry_request(env_vars: std::collections::HashMap<String, String
                     crate::core::log_bus::push("registry", format!("fetch failed: {e}"));
                     if let Some(cached) = extension_registry::load_cache() {
                         let _ = tx.send(TaskResult::RegistryData { entries: cached });
+                    } else {
+                        return super::TaskOutcome::failure(
+                            "extension registry",
+                            "fetch",
+                            e.to_string(),
+                        );
                     }
                 }
-            },
-        ),
+            }
+            super::TaskOutcome::Success
+        }),
     }
 }
 
@@ -959,4 +822,31 @@ fn is_valid_git_url(s: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(title: &str) -> RegistryEntry {
+        RegistryEntry {
+            title: title.into(),
+            author: String::new(),
+            reference: format!("https://github.com/example/{title}"),
+            description: String::new(),
+        }
+    }
+
+    #[test]
+    fn page_down_works_after_page_up_focuses_url_input() {
+        let mut tab = InstallTab::new();
+        tab.catalog = vec![entry("one"), entry("two"), entry("three")];
+        tab.catalog_visible_rows.set(2);
+
+        tab.on_key(KeyCode::PageUp, &Config::default(), &[]);
+        assert_eq!((tab.grid.row(), tab.grid.col()), (0, 0));
+
+        tab.on_key(KeyCode::PageDown, &Config::default(), &[]);
+        assert_eq!((tab.grid.row(), tab.grid.list_selected()), (2, 2));
+    }
 }

@@ -2,27 +2,21 @@
 
 use crate::core::{clipboard, i18n, log_bus};
 use crate::widgets::button::{Button, ButtonKind};
-use crate::widgets::log_view::LogView;
+use crate::widgets::log_display::{LogBusSource, LogDisplay, LogDisplayOptions, LogNavigation};
 use crate::widgets::popup::notice::{Notice, NoticeCopy, NoticeOutcome};
 use crossterm::event::{KeyCode, MouseEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::widgets::{Block, Borders};
 use ratatui::Frame;
 
 /// Launcher log viewer screen.
 pub struct LauncherLogs {
-    /// Underlying scrollable log viewer.
-    pub log: LogView,
+    /// Shared scrollable log display.
+    pub log: LogDisplay,
     /// Optional notice popup currently displayed.
     pub message: Option<Notice>,
     /// Whether the Export Logs button is keyboard-focused.
     pub export_focused: bool,
-    /// Total log line count from the last frame, used for scroll math.
-    last_total: u16,
-    /// Whether the viewer is pinned to the tail.
-    ///
-    /// Cleared when the user scrolls up and re-armed by `End` or by
-    /// scrolling back to the bottom.
-    sticky_tail: bool,
     /// Flash message awaiting promotion to the application banner.
     pub pending_flash: Option<(crate::app::FlashKind, String)>,
     /// Persistent Export Logs button.
@@ -33,11 +27,9 @@ impl LauncherLogs {
     /// Constructs a fresh launcher logs screen.
     pub fn new() -> Self {
         Self {
-            log: LogView::new(),
+            log: LogDisplay::new(),
             message: None,
             export_focused: true,
-            last_total: 0,
-            sticky_tail: true,
             pending_flash: None,
             btn_export: Button::new(ButtonKind::Default),
         }
@@ -65,7 +57,16 @@ impl LauncherLogs {
     /// Renders the screen into `area`.
     pub fn render(&self, f: &mut Frame, area: Rect, body_active: bool) {
         let (body, btn) = Self::layout(area);
-        self.log.render(f, body);
+        let options = LogDisplayOptions {
+            block: Some(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(crate::core::theme::border())
+                    .title(format!(" {} ", i18n::t("label_console"))),
+            ),
+            ..LogDisplayOptions::default()
+        };
+        self.log.render(f, body, &LogBusSource, options);
         self.btn_export.render(
             f,
             btn,
@@ -79,12 +80,8 @@ impl LauncherLogs {
 
     /// Per-frame housekeeping called from `App::tick`.
     ///
-    /// Propagates sticky-tail intent to the log widget, records the total
-    /// line count for navigation math, and polls the Export button's
-    /// deferred-fire pipeline.
+    /// Polls the Export button and notice popup deferred-fire pipelines.
     pub fn tick(&mut self) {
-        self.last_total = log_bus::snapshot().len() as u16;
-        self.log.sticky_tail = self.sticky_tail;
         if self.btn_export.poll_fire() {
             self.export();
         }
@@ -128,50 +125,27 @@ impl LauncherLogs {
                 true
             }
             KeyCode::Up => {
-                let visible = self.log.visible.get();
-                let max_off = self.last_total.saturating_sub(visible);
-                if self.sticky_tail {
-                    self.log.scroll = max_off;
-                    self.sticky_tail = false;
-                }
-                self.log.scroll = self.log.scroll.saturating_sub(1);
+                self.log.navigate(LogNavigation::Lines(-1));
                 true
             }
             KeyCode::Down => {
-                let visible = self.log.visible.get();
-                let max_off = self.last_total.saturating_sub(visible);
-                self.log.scroll = self.log.scroll.saturating_add(1).min(max_off);
-                if self.log.scroll >= max_off {
-                    self.sticky_tail = true;
-                }
+                self.log.navigate(LogNavigation::Lines(1));
                 true
             }
             KeyCode::PageUp => {
-                let visible = self.log.visible.get();
-                let max_off = self.last_total.saturating_sub(visible);
-                if self.sticky_tail {
-                    self.log.scroll = max_off;
-                    self.sticky_tail = false;
-                }
-                self.log.scroll = self.log.scroll.saturating_sub(visible.max(1));
+                self.log.navigate(LogNavigation::Pages(-1));
                 true
             }
             KeyCode::PageDown => {
-                let visible = self.log.visible.get();
-                let max_off = self.last_total.saturating_sub(visible);
-                self.log.scroll = self.log.scroll.saturating_add(visible.max(1)).min(max_off);
-                if self.log.scroll >= max_off {
-                    self.sticky_tail = true;
-                }
+                self.log.navigate(LogNavigation::Pages(1));
                 true
             }
             KeyCode::Home => {
-                self.sticky_tail = false;
-                self.log.scroll = 0;
+                self.log.navigate(LogNavigation::Home);
                 true
             }
             KeyCode::End => {
-                self.sticky_tail = true;
+                self.log.navigate(LogNavigation::End);
                 true
             }
             KeyCode::Enter => {

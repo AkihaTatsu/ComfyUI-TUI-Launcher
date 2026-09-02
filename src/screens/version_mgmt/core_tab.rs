@@ -364,6 +364,22 @@ impl CoreTab {
         self.grid.set_list_len(n);
         self.grid.set_visible_rows(self.visible_rows.get().max(1));
 
+        // Page keys operate on the full focus grid, even while the search
+        // input is focused.
+        match code {
+            KeyCode::PageUp => {
+                self.grid.page_up();
+                self.save_filter_state();
+                return None;
+            }
+            KeyCode::PageDown => {
+                self.grid.page_down();
+                self.save_filter_state();
+                return None;
+            }
+            _ => {}
+        }
+
         // Search input has focus.
         if self.search_focused() {
             match code {
@@ -416,16 +432,6 @@ impl CoreTab {
                 } else {
                     self.grid.move_down();
                 }
-                self.save_filter_state();
-                None
-            }
-            KeyCode::PageUp => {
-                self.grid.page_up();
-                self.save_filter_state();
-                None
-            }
-            KeyCode::PageDown => {
-                self.grid.page_down();
                 self.save_filter_state();
                 None
             }
@@ -692,6 +698,7 @@ pub fn load_request_with_env(
         title: i18n::t("task_core_load"),
         then: TaskKind::None,
         is_refresh: true,
+        changes_repository: false,
         work: Box::new(move |tx| {
             // Fetch first so HEAD/remote refs are current, then deepen if the
             // repo is a shallow clone — otherwise `git log` would silently
@@ -716,6 +723,42 @@ pub fn load_request_with_env(
                 root,
                 requested_limit: limit,
             });
+            super::TaskOutcome::Success
+        }),
+    }
+}
+
+/// Background local-only load followed by a remote refresh. This replaces the
+/// old UI-thread `scan_local` call while still showing cached repository state
+/// before network work finishes.
+pub fn local_load_request(
+    root: PathBuf,
+    env_vars: std::collections::HashMap<String, String>,
+    limit: usize,
+) -> TaskRequest {
+    let then = TaskKind::CoreLoad {
+        root: root.clone(),
+        env: env_vars,
+        limit,
+    };
+    TaskRequest {
+        title: i18n::t("task_core_load"),
+        then,
+        is_refresh: true,
+        changes_repository: false,
+        work: Box::new(move |tx| {
+            let scan = scan_local(&root, limit);
+            let _ = tx.send(TaskResult::CoreData {
+                commits: scan.commits,
+                tags: scan.tags,
+                current: scan.current,
+                current_tag: scan.current_tag,
+                branch: scan.branch,
+                remote: scan.remote,
+                root,
+                requested_limit: limit,
+            });
+            super::TaskOutcome::Success
         }),
     }
 }
@@ -725,30 +768,68 @@ fn pull_request(
     env_vars: std::collections::HashMap<String, String>,
     python: String,
 ) -> TaskRequest {
-    let then = TaskKind::CoreLoad(root.clone());
+    let then = TaskKind::CoreLoad {
+        root: root.clone(),
+        env: env_vars.clone(),
+        limit: super::LIST_MAX_NUM,
+    };
     TaskRequest {
         title: i18n::t("task_core_pull"),
         then,
         is_refresh: false,
-        work: Box::new(move |_tx| {
+        changes_repository: true,
+        work: Box::new(move |tx| {
             // Same fetch+reset strategy as extensions: works for detached
             // HEAD (from prior Change Version) and discards local edits to
             // tracked files (untracked files are kept).
-            let _ = git::fetch(&root, env_vars.clone());
-            // On a branch → @{u}; detached HEAD → origin/HEAD then FETCH_HEAD.
+            let fetched = git::fetch(&root, env_vars.clone()).unwrap_or(false);
+            if !fetched {
+                return super::TaskOutcome::failure(
+                    "ComfyUI",
+                    "git fetch",
+                    "command failed; see the task log",
+                );
+            }
+            // Prefer the configured upstream on a branch, but retain remote
+            // fallbacks for repositories whose local branch has no upstream.
+            // Detached HEAD starts directly with those fallbacks.
             let targets: &[&str] = if git::current_branch(&root).is_some() {
-                &["@{u}"]
+                &["@{u}", "origin/HEAD", "FETCH_HEAD"]
             } else {
                 &["origin/HEAD", "FETCH_HEAD"]
             };
+            let mut reset_ok = false;
             for t in targets {
                 if git::reset_hard(&root, t, env_vars.clone()).unwrap_or(false) {
+                    reset_ok = true;
                     break;
                 }
             }
-            if !python.is_empty() {
-                let _ = pip::install_requirements(std::path::Path::new(&python), &root, env_vars);
+            if !reset_ok {
+                return super::TaskOutcome::failure(
+                    "ComfyUI",
+                    "git reset",
+                    "no upstream target could be checked out; see the task log",
+                );
             }
+
+            let _ = tx.send(TaskResult::CoreHeadUpdate {
+                current: git::current_commit(&root),
+                current_tag: git::current_release_tag(&root),
+            });
+            if !python.is_empty() {
+                let pip_ok =
+                    pip::install_requirements(std::path::Path::new(&python), &root, env_vars)
+                        .unwrap_or(false);
+                if !pip_ok {
+                    return super::TaskOutcome::PartialFailure(vec![super::ItemFailure::new(
+                        "ComfyUI",
+                        "pip install",
+                        "source changed, but dependency installation failed; see the task log",
+                    )]);
+                }
+            }
+            super::TaskOutcome::Success
         }),
     }
 }
@@ -767,15 +848,60 @@ fn checkout_request(
         // marked as "Current". The user can hit R to fetch fresh upstream.
         then: TaskKind::None,
         is_refresh: false,
+        changes_repository: true,
         work: Box::new(move |tx| {
-            let _ = git::checkout(&root, &rev, env_vars.clone());
-            if !python.is_empty() {
-                let _ = pip::install_requirements(std::path::Path::new(&python), &root, env_vars);
+            let checkout_ok = git::checkout(&root, &rev, env_vars.clone()).unwrap_or(false);
+            if !checkout_ok {
+                return super::TaskOutcome::failure(
+                    "ComfyUI",
+                    "git checkout",
+                    format!("could not switch to {rev}; see the task log"),
+                );
             }
             let _ = tx.send(TaskResult::CoreHeadUpdate {
                 current: git::current_commit(&root),
                 current_tag: git::current_release_tag(&root),
             });
+            if !python.is_empty() {
+                let pip_ok =
+                    pip::install_requirements(std::path::Path::new(&python), &root, env_vars)
+                        .unwrap_or(false);
+                if !pip_ok {
+                    return super::TaskOutcome::PartialFailure(vec![super::ItemFailure::new(
+                        "ComfyUI",
+                        "pip install",
+                        "version changed, but dependency installation failed; see the task log",
+                    )]);
+                }
+            }
+            super::TaskOutcome::Success
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tag(name: &str) -> git::TagCommit {
+        git::TagCommit {
+            tag: name.into(),
+            commit_short: String::new(),
+            commit_date: String::new(),
+            commit_subject: String::new(),
+        }
+    }
+
+    #[test]
+    fn page_down_works_after_page_up_focuses_search() {
+        let mut tab = CoreTab::new();
+        tab.tags = vec![tag("v1.0.0"), tag("v1.0.1"), tag("v1.0.2")];
+        tab.visible_rows.set(2);
+
+        tab.on_key(KeyCode::PageUp, &Config::default());
+        assert!(tab.search_focused());
+
+        tab.on_key(KeyCode::PageDown, &Config::default());
+        assert_eq!((tab.grid.row(), tab.grid.list_selected()), (1, 2));
     }
 }

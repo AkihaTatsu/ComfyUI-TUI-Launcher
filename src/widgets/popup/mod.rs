@@ -55,3 +55,26 @@ pub fn clear_widechar_safe(f: &mut Frame, area: Rect) {
     };
     f.render_widget(Clear, expanded);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn centered_popup_never_escapes_tiny_parent() {
+        for width in 0..8 {
+            for height in 0..8 {
+                let parent = Rect::new(7, 11, width, height);
+                let popup = center(parent, u16::MAX, u16::MAX);
+                assert!(popup.x >= parent.x);
+                assert!(popup.y >= parent.y);
+                assert!(
+                    popup.x.saturating_add(popup.width) <= parent.x.saturating_add(parent.width)
+                );
+                assert!(
+                    popup.y.saturating_add(popup.height) <= parent.y.saturating_add(parent.height)
+                );
+            }
+        }
+    }
+}

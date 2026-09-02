@@ -110,6 +110,10 @@ pub struct Network {
     /// only one `HF_ENDPOINT`.
     #[serde(default, deserialize_with = "de_hf_mirror")]
     pub hf_mirror: String,
+    /// When enabled, ComfyUI launches through an in-memory Python wrapper
+    /// that rewrites Huggingface URLs to the configured mirror.
+    #[serde(default)]
+    pub hf_force_mirror: bool,
     /// GitHub acceleration proxy URL prefix(es), semicolon-separated.
     ///
     /// The first item is exported as `GH_ACCEL`.

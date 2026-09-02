@@ -35,3 +35,14 @@ The binary lands at `target/release/comfyui-tui-launcher` (`.exe` on Windows). C
 | Portable | `<exe_dir>/local_data/config/`         | `<exe_dir>\local_data\config\`                 |
 
 The launcher never touches your ComfyUI directory or model files; its own config is fully separate.
+
+## Clipboard
+
+Copy actions use two portable paths:
+
+- Normal desktop sessions use the native Windows, macOS, X11, or Wayland clipboard.
+- SSH, Mosh, tmux, Zellij, GNU Screen, and Herdr sessions send the copy to the outer terminal, so an SSH server never tries to contact a remote X11 display.
+
+Terminal copying uses OSC 52. tmux 3.2 or newer is the only special case: the launcher uses `tmux set-buffer -w`, which works with tmux's secure default `set-clipboard=external`. The tmux client still needs the `clipboard`/`Ms` terminal capability; see the [tmux clipboard guide](https://github.com/tmux/tmux/wiki/Clipboard).
+
+The terminal emulator must allow OSC 52 clipboard writes. Zellij, current Herdr releases, Mosh, GNU Screen, and other transports must pass OSC 52 through. OSC 52 has no portable acknowledgement, so a success notice means the request reached the outer terminal; the terminal's security policy still decides whether to accept it.

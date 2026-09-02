@@ -121,3 +121,76 @@ pub fn wrap_to_width(s: &str, max_cells: usize) -> Vec<String> {
     }
     out
 }
+
+/// Converts process output into text that is safe to render in the TUI.
+///
+/// Progress tools such as tqdm and rich use carriage returns and ANSI
+/// sequences to redraw a terminal line in place. Those bytes must not reach
+/// ratatui as literal text because the terminal would execute them while the
+/// frame is being drawn.
+pub fn sanitize_for_tui_log(s: &str) -> String {
+    let after_cr = s.rsplit('\r').next().unwrap_or(s);
+    strip_ansi_and_controls(after_cr)
+}
+
+fn strip_ansi_and_controls(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            match chars.peek().copied() {
+                Some('[') => {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    let mut prev_esc = false;
+                    for c in chars.by_ref() {
+                        if c == '\x07' || (prev_esc && c == '\\') {
+                            break;
+                        }
+                        prev_esc = c == '\x1b';
+                    }
+                }
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '\t' => out.push_str("    "),
+            '\n' | '\r' => out.push(' '),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitizes_ansi_and_carriage_returns() {
+        assert_eq!(sanitize_for_tui_log("\x1b[31mERROR\x1b[0m"), "ERROR");
+        assert_eq!(sanitize_for_tui_log("\x1b[2K\r100%"), "100%");
+        assert_eq!(sanitize_for_tui_log("10%\r50%\r100%"), "100%");
+    }
+
+    #[test]
+    fn preserves_visible_progress_text() {
+        assert_eq!(
+            sanitize_for_tui_log("正在下载 50%|████"),
+            "正在下载 50%|████"
+        );
+    }
+}

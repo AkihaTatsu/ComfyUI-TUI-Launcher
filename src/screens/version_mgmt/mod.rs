@@ -11,14 +11,19 @@ pub mod extensions_tab;
 pub mod install_tab;
 
 use crate::core::config::Config;
-use crate::core::{i18n, log_bus, text, theme};
+use crate::core::{i18n, log_bus, theme};
+use crate::widgets::log_display::{
+    LogBusSource, LogDisplay, LogDisplayOptions, LogRange, LogViewportMode,
+};
 use crate::widgets::popup;
-use crate::widgets::tabs::Tabs;
+use crate::widgets::popup::notice::{Notice, NoticeOutcome};
+use crate::widgets::tabs::{Tabs, TabsState};
 use crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders};
 use ratatui::Frame;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
@@ -34,7 +39,7 @@ pub struct TaskRequest {
     /// Human-readable title shown in the working popup.
     pub title: String,
     /// Background closure to execute.
-    pub work: Box<dyn FnOnce(mpsc::Sender<TaskResult>) + Send + 'static>,
+    pub work: Box<dyn FnOnce(mpsc::Sender<TaskResult>) -> TaskOutcome + Send + 'static>,
     /// Follow-up task queued after this one completes.
     pub then: TaskKind,
     /// Whether this is a read-only refresh task.
@@ -44,6 +49,10 @@ pub struct TaskRequest {
     /// runs at a time; manual triggers drop silently while busy, and auto
     /// triggers are queued.
     pub is_refresh: bool,
+    /// Whether successful completion may have changed a repository or
+    /// extension on disk. Some read-only tasks are modal but must not
+    /// invalidate repository snapshots or display a mutation-success banner.
+    pub changes_repository: bool,
 }
 
 /// Identifier for a follow-up task to queue after the current one finishes.
@@ -52,9 +61,17 @@ pub enum TaskKind {
     /// No follow-up.
     None,
     /// Reload the Core commit list from the given repository path.
-    CoreLoad(PathBuf),
+    CoreLoad {
+        root: PathBuf,
+        env: std::collections::HashMap<String, String>,
+        limit: usize,
+    },
     /// Reload the extensions list from the given ComfyUI root.
-    ExtLoad(PathBuf),
+    ExtLoad {
+        root: PathBuf,
+        env: std::collections::HashMap<String, String>,
+        limit: usize,
+    },
 }
 
 /// Cap on the number of rows fetched in a single load. Additional
@@ -145,6 +162,56 @@ pub enum TaskResult {
         /// Release tag name if the new `HEAD` is exactly at one.
         current_tag: Option<String>,
     },
+    /// Terminal status sent by the task wrapper after all data/progress
+    /// events. Unlike channel disconnect, this distinguishes success,
+    /// partial success, and a real failure.
+    Finished(TaskOutcome),
+}
+
+/// One failed item/stage inside a task.
+#[derive(Debug, Clone)]
+pub struct ItemFailure {
+    pub item: String,
+    pub stage: String,
+    pub message: String,
+}
+
+impl ItemFailure {
+    pub fn new(
+        item: impl Into<String>,
+        stage: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            item: item.into(),
+            stage: stage.into(),
+            message: message.into(),
+        }
+    }
+}
+
+/// Final mutation result. `PartialFailure` means some durable state changed
+/// (for example Git succeeded but pip failed, or only part of Update All
+/// completed), so callers must refresh from disk rather than roll back the UI.
+#[derive(Debug, Clone)]
+pub enum TaskOutcome {
+    Success,
+    PartialFailure(Vec<ItemFailure>),
+    Failure(Vec<ItemFailure>),
+}
+
+fn outcome_allows_follow_up(outcome: &TaskOutcome) -> bool {
+    !matches!(outcome, TaskOutcome::Failure(_))
+}
+
+impl TaskOutcome {
+    pub fn failure(
+        item: impl Into<String>,
+        stage: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::Failure(vec![ItemFailure::new(item, stage, message)])
+    }
 }
 
 struct PendingTask {
@@ -152,12 +219,15 @@ struct PendingTask {
     rx: mpsc::Receiver<TaskResult>,
     then: TaskKind,
     progress: Option<(usize, usize)>,
+    changes_repository: bool,
 }
 
 /// Version management screen state.
 pub struct VersionMgmt {
     /// Active tab index.
     pub tab: usize,
+    /// Persistent horizontal viewport for the version-management tab strip.
+    tabs_state: TabsState,
     /// Core tab state.
     pub core: core_tab::CoreTab,
     /// Extensions tab state.
@@ -170,9 +240,21 @@ pub struct VersionMgmt {
     /// Active refresh task. Runs in the background and surfaces progress
     /// via the top-right banner without locking input.
     refresh: Option<PendingTask>,
-    /// One queued auto-refresh, promoted into `refresh` the moment the
-    /// current one finishes. Manual refreshes bypass this slot.
-    queued_refresh: Option<TaskRequest>,
+    /// FIFO of automatic refreshes, promoted into `refresh` as each prior
+    /// request finishes. Manual refreshes bypass this queue.
+    queued_refresh: VecDeque<TaskRequest>,
+    /// Persistent result popup for failed/partially failed mutations.
+    result_notice: Option<Notice>,
+    /// Shared tail-following log display used by the blocking task popup.
+    pending_logs: LogDisplay,
+    /// One-shot task status promoted to the application banner.
+    task_flash: Option<(crate::app::FlashKind, String)>,
+    /// Set after a mutation changed repository state so the main-page info
+    /// snapshot can be invalidated without polling Git from the UI thread.
+    repo_changed: bool,
+    core_requested_for: Option<PathBuf>,
+    ext_requested_for: Option<PathBuf>,
+    registry_requested: bool,
 }
 
 impl VersionMgmt {
@@ -180,12 +262,20 @@ impl VersionMgmt {
     pub fn new() -> Self {
         Self {
             tab: 0,
+            tabs_state: TabsState::default(),
             core: core_tab::CoreTab::new(),
             ext: extensions_tab::ExtensionsTab::new(),
             install: install_tab::InstallTab::new(),
             pending: None,
             refresh: None,
-            queued_refresh: None,
+            queued_refresh: VecDeque::new(),
+            result_notice: None,
+            pending_logs: LogDisplay::new(),
+            task_flash: None,
+            repo_changed: false,
+            core_requested_for: None,
+            ext_requested_for: None,
+            registry_requested: false,
         }
     }
 
@@ -197,49 +287,19 @@ impl VersionMgmt {
         self.pending.is_some()
     }
 
-    /// Synchronously populate `self.ext.items` from a local-only scan so the
-    /// Extensions list renders immediately on tab entry / manual refresh —
-    /// independent of the background `git fetch` work that follows.
-    fn populate_ext_local(&mut self, root: &std::path::Path, limit: usize) {
-        let items = extensions_tab::scan_local(root, limit);
-        self.ext.end_reached = items.len() < limit;
-        self.ext.limit = limit;
-        self.ext.items = items;
-        self.ext.loaded_for = Some(root.to_path_buf());
-        let n = self.ext.filtered_indices().len();
-        if self.ext.selected >= n {
-            self.ext.selected = n.saturating_sub(1);
-        }
-        self.ext.ensure_visible();
-    }
-
-    /// Same idea as `populate_ext_local` but for the Core tab. Reads local
-    /// git log + HEAD info; no fetch.
-    fn populate_core_local(&mut self, root: &std::path::Path, limit: usize) {
-        let scan = core_tab::scan_local(root, limit);
-        self.core.end_reached = scan.commits.len() < limit;
-        self.core.limit = limit;
-        self.core.commits = scan.commits;
-        self.core.tags = scan.tags;
-        self.core.current = scan.current;
-        self.core.current_tag = scan.current_tag;
-        self.core.branch = scan.branch;
-        self.core.remote = scan.remote;
-        self.core.loaded_for = Some(root.to_path_buf());
-        if self.core.all_list_selected >= self.core.commits.len() {
-            self.core.all_list_selected = self.core.commits.len().saturating_sub(1);
-        }
-        if self.core.stable_list_selected >= self.core.tags.len() {
-            self.core.stable_list_selected = self.core.tags.len().saturating_sub(1);
-        }
-        self.core.restore_filter_state();
-        self.core.ensure_visible();
-    }
-
     /// Drains transient flash messages from the Extensions and Install
     /// sub-tabs and surfaces them to the application.
     pub fn take_flash(&mut self) -> Option<(crate::app::FlashKind, String)> {
-        self.ext.take_flash().or_else(|| self.install.take_flash())
+        self.task_flash
+            .take()
+            .or_else(|| self.ext.take_flash())
+            .or_else(|| self.install.take_flash())
+    }
+
+    /// Returns and clears the repository-change notification consumed by the
+    /// main screen's asynchronous information cache.
+    pub fn take_repo_changed(&mut self) -> bool {
+        std::mem::take(&mut self.repo_changed)
     }
 
     /// Returns the sticky banner text reflecting the current background
@@ -258,7 +318,14 @@ impl VersionMgmt {
     /// Drains each task channel, applies new data, chains the follow-up
     /// when a task finishes, and lazily kicks off the initial load when
     /// the user lands on a tab for the first time.
-    pub fn tick(&mut self, cfg: &Config) {
+    pub fn tick(&mut self, cfg: &Config) -> bool {
+        let mut changed = false;
+        if let Some(notice) = &mut self.result_notice {
+            if matches!(notice.tick(), Some(NoticeOutcome::Close)) {
+                self.result_notice = None;
+                changed = true;
+            }
+        }
         // Poll each sub-tab's persistent button widgets so the deferred
         // click-then-fire pipeline drains.
         let req = self
@@ -267,15 +334,17 @@ impl VersionMgmt {
             .or_else(|| self.install.poll_button_action(cfg));
         if let Some(req) = req {
             self.spawn(req);
+            changed = true;
         }
         // Drain both task slots; the two share the same logic and route
         // Progress updates to the slot they came from.
-        self.drain_slot(true);
-        self.drain_slot(false);
+        changed |= self.drain_slot(true);
+        changed |= self.drain_slot(false);
         // Promote any queued auto-refresh into the now-free slot.
         if self.refresh.is_none() {
-            if let Some(req) = self.queued_refresh.take() {
+            if let Some(req) = self.queued_refresh.pop_front() {
                 self.spawn_inner(req);
+                changed = true;
             }
         }
         // Lazily kick off the initial load for the active tab as a
@@ -284,71 +353,91 @@ impl VersionMgmt {
         let root = std::path::Path::new(&cfg.general.comfyui_dir).to_path_buf();
         // Re-evaluate every tick, but only when the queue slot is empty,
         // so a queued request is not overwritten on every frame.
-        if !root.as_os_str().is_empty() && self.queued_refresh.is_none() {
+        if !root.as_os_str().is_empty() && self.queued_refresh.is_empty() {
             match self.tab {
                 // 0 = Core (Stable), 1 = Core (All) — share the same scan task.
                 0 | 1 if self.core.loaded_for.as_deref() != Some(&root) => {
-                    let env_vars = crate::core::env::build(&cfg.network);
-                    self.spawn_auto(core_tab::load_request_with_env(
-                        root,
-                        env_vars,
-                        LIST_MAX_NUM,
-                    ));
+                    if self.core_requested_for.as_deref() != Some(&root) {
+                        self.core_requested_for = Some(root.clone());
+                        let env_vars = crate::core::env::build(&cfg.network);
+                        self.spawn_auto(core_tab::local_load_request(root, env_vars, LIST_MAX_NUM));
+                        changed = true;
+                    }
                 }
                 2 if self.ext.loaded_for.as_deref() != Some(&root) => {
-                    self.populate_ext_local(&root, LIST_MAX_NUM);
-                    let env_vars = crate::core::env::build(&cfg.network);
-                    self.spawn_auto(extensions_tab::load_request_with_limit(
-                        root,
-                        LIST_MAX_NUM,
-                        env_vars,
-                    ));
+                    if self.ext_requested_for.as_deref() != Some(&root) {
+                        self.ext_requested_for = Some(root.clone());
+                        let env_vars = crate::core::env::build(&cfg.network);
+                        self.spawn_auto(extensions_tab::local_load_request(
+                            root,
+                            LIST_MAX_NUM,
+                            env_vars,
+                        ));
+                        changed = true;
+                    }
                 }
                 3 if self.ext.loaded_for.as_deref() != Some(&root) => {
-                    // Install New needs the local list for install-state
-                    // comparison; populate synchronously so catalog rows
-                    // render with correct Installed badges immediately.
-                    self.populate_ext_local(&root, LIST_MAX_NUM);
-                    let env_vars = crate::core::env::build(&cfg.network);
-                    self.spawn_auto(extensions_tab::load_request_with_limit(
-                        root,
-                        LIST_MAX_NUM,
-                        env_vars,
-                    ));
+                    if self.ext_requested_for.as_deref() != Some(&root) {
+                        self.ext_requested_for = Some(root.clone());
+                        let env_vars = crate::core::env::build(&cfg.network);
+                        self.spawn_auto(extensions_tab::local_load_request(
+                            root,
+                            LIST_MAX_NUM,
+                            env_vars,
+                        ));
+                        changed = true;
+                    }
                 }
-                3 if !self.install.catalog_loaded => {
+                3 if !self.install.catalog_loaded && !self.registry_requested => {
+                    self.registry_requested = true;
                     let env_vars = crate::core::env::build(&cfg.network);
                     self.spawn_auto(install_tab::fetch_registry_request(env_vars));
+                    changed = true;
                 }
                 _ => {}
             }
         }
+        changed
     }
 
     /// Drains the active slot's channel, routes `Progress` into the
     /// slot's own field, hands data results to `apply_result`, and on
     /// disconnect clears the slot and queues the chained `then`.
-    fn drain_slot(&mut self, for_refresh: bool) {
+    fn drain_slot(&mut self, for_refresh: bool) -> bool {
         let slot = if for_refresh {
             &mut self.refresh
         } else {
             &mut self.pending
         };
         if slot.is_none() {
-            return;
+            return false;
         }
+        let mut changed = false;
         let mut to_apply: Vec<TaskResult> = Vec::new();
-        let mut finished_then: Option<TaskKind> = None;
+        let mut finished: Option<(TaskKind, TaskOutcome, bool)> = None;
         if let Some(p) = slot {
             loop {
                 match p.rx.try_recv() {
                     Ok(TaskResult::Progress { done, total }) => {
                         p.progress = Some((done, total));
+                        changed = true;
+                    }
+                    Ok(TaskResult::Finished(outcome)) => {
+                        finished = Some((p.then.clone(), outcome, p.changes_repository));
+                        break;
                     }
                     Ok(res) => to_apply.push(res),
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
-                        finished_then = Some(p.then.clone());
+                        finished = Some((
+                            p.then.clone(),
+                            TaskOutcome::failure(
+                                &p.title,
+                                "worker",
+                                "background worker ended without a result",
+                            ),
+                            p.changes_repository,
+                        ));
                         break;
                     }
                 }
@@ -356,15 +445,76 @@ impl VersionMgmt {
         }
         for r in to_apply {
             self.apply_result(r);
+            changed = true;
         }
-        if let Some(then) = finished_then {
+        if let Some((then, outcome, changes_repository)) = finished {
             if for_refresh {
                 self.refresh = None;
             } else {
                 self.pending = None;
             }
-            self.queue_kind(then);
+            let run_follow_up = outcome_allows_follow_up(&outcome);
+            self.handle_outcome(for_refresh, changes_repository, outcome);
+            if run_follow_up {
+                self.queue_kind(then);
+            }
+            changed = true;
         }
+        changed
+    }
+
+    fn handle_outcome(&mut self, for_refresh: bool, changed: bool, outcome: TaskOutcome) {
+        match outcome {
+            TaskOutcome::Success => {
+                if !for_refresh && changed {
+                    self.repo_changed = true;
+                    self.task_flash =
+                        Some((crate::app::FlashKind::Info, i18n::t("task_result_success")));
+                }
+            }
+            TaskOutcome::PartialFailure(failures) => {
+                if changed {
+                    self.repo_changed = true;
+                }
+                self.show_task_failures(true, failures);
+            }
+            TaskOutcome::Failure(failures) => {
+                if for_refresh {
+                    let message = failures
+                        .first()
+                        .map(|f| format!("{}: {}", f.stage, f.message))
+                        .unwrap_or_else(|| i18n::t("task_result_failed"));
+                    log_bus::push("task", format!("refresh failed: {message}"));
+                } else {
+                    self.show_task_failures(false, failures);
+                }
+            }
+        }
+    }
+
+    fn show_task_failures(&mut self, partial: bool, failures: Vec<ItemFailure>) {
+        let title = if partial {
+            i18n::t("task_result_partial")
+        } else {
+            i18n::t("task_result_failed")
+        };
+        let mut body = String::new();
+        for failure in failures.iter().take(12) {
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(&format!(
+                "{} — {}: {}",
+                failure.item, failure.stage, failure.message
+            ));
+        }
+        if failures.len() > 12 {
+            body.push_str(&format!("\n… +{}", failures.len() - 12));
+        }
+        if let Some(path) = log_bus::file_path() {
+            body.push_str(&format!("\n\n{}", path.display()));
+        }
+        self.result_notice = Some(Notice::new(title, body, None));
     }
 
     fn apply_result(&mut self, r: TaskResult) {
@@ -388,6 +538,7 @@ impl VersionMgmt {
                 self.core.branch = branch;
                 self.core.remote = remote;
                 self.core.loaded_for = Some(root);
+                self.core_requested_for = None;
                 if self.core.all_list_selected >= self.core.commits.len() {
                     self.core.all_list_selected = self.core.commits.len().saturating_sub(1);
                 }
@@ -406,18 +557,16 @@ impl VersionMgmt {
                 self.ext.limit = requested_limit;
                 self.ext.items = items;
                 self.ext.loaded_for = Some(root);
+                self.ext_requested_for = None;
                 let n = self.ext.filtered_indices().len();
-                if self.ext.selected >= n {
-                    self.ext.selected = n.saturating_sub(1);
-                }
+                self.ext.grid.set_list_len(n);
                 self.ext.ensure_visible();
             }
             TaskResult::RegistryData { entries } => {
                 self.install.catalog = entries;
                 self.install.catalog_loaded = true;
-                if self.install.catalog_selected >= self.install.catalog.len() {
-                    self.install.catalog_selected = self.install.catalog.len().saturating_sub(1);
-                }
+                self.registry_requested = false;
+                self.install.grid.set_list_len(self.install.catalog.len());
             }
             // Progress is consumed inside `drain_slot`; reaching
             // `apply_result` is a no-op fallback.
@@ -431,9 +580,7 @@ impl VersionMgmt {
                 if let Some(i) = self.ext.items.iter().position(|e| e.path == path) {
                     self.ext.items.remove(i);
                     let n = self.ext.filtered_indices().len();
-                    if self.ext.selected >= n {
-                        self.ext.selected = n.saturating_sub(1);
-                    }
+                    self.ext.grid.set_list_len(n);
                     self.ext.ensure_visible();
                 }
             }
@@ -453,6 +600,7 @@ impl VersionMgmt {
                 self.core.current = current;
                 self.core.current_tag = current_tag;
             }
+            TaskResult::Finished(_) => {}
             TaskResult::ExtCommits {
                 ext_path,
                 commits,
@@ -490,6 +638,10 @@ impl VersionMgmt {
     /// Returns whether Esc was consumed so the application does not
     /// re-focus the menu.
     pub fn eat_esc(&mut self) -> bool {
+        if self.result_notice.is_some() {
+            self.result_notice = None;
+            return true;
+        }
         if self.ext.notice.is_some() {
             self.ext.notice = None;
             return true;
@@ -528,23 +680,11 @@ impl VersionMgmt {
         // `behind` and unmerged-upstream rows.
         match kind {
             TaskKind::None => {}
-            TaskKind::CoreLoad(root) => {
-                let limit = self.core.limit;
-                self.populate_core_local(&root, limit);
-                self.spawn_auto(core_tab::load_request_with_env(
-                    root,
-                    std::collections::HashMap::new(),
-                    limit,
-                ));
+            TaskKind::CoreLoad { root, env, limit } => {
+                self.spawn_auto(core_tab::load_request_with_env(root, env, limit));
             }
-            TaskKind::ExtLoad(root) => {
-                let limit = self.ext.limit;
-                self.populate_ext_local(&root, limit);
-                self.spawn_auto(extensions_tab::load_request_with_limit(
-                    root,
-                    limit,
-                    std::collections::HashMap::new(),
-                ));
+            TaskKind::ExtLoad { root, env, limit } => {
+                self.spawn_auto(extensions_tab::load_request_with_limit(root, limit, env));
             }
         }
     }
@@ -559,7 +699,7 @@ impl VersionMgmt {
                 return;
             }
             self.spawn_inner(req);
-        } else {
+        } else if self.pending.is_none() {
             self.spawn_inner(req);
         }
     }
@@ -571,7 +711,7 @@ impl VersionMgmt {
     fn spawn_auto(&mut self, req: TaskRequest) {
         if req.is_refresh {
             if self.refresh.is_some() {
-                self.queued_refresh = Some(req);
+                self.queued_refresh.push_back(req);
                 return;
             }
             self.spawn_inner(req);
@@ -586,13 +726,15 @@ impl VersionMgmt {
         let work = req.work;
         log_bus::push("task", format!("start: {title}"));
         thread::spawn(move || {
-            work(tx);
+            let outcome = work(tx.clone());
+            let _ = tx.send(TaskResult::Finished(outcome));
         });
         let task = PendingTask {
             title,
             rx,
             then: req.then,
             progress: None,
+            changes_repository: req.changes_repository,
         };
         if req.is_refresh {
             self.refresh = Some(task);
@@ -616,6 +758,7 @@ impl VersionMgmt {
         Tabs {
             items: &names,
             selected: self.tab,
+            state: &self.tabs_state,
             highlighted: None,
         }
         .render(f, v[0]);
@@ -633,6 +776,9 @@ impl VersionMgmt {
         }
         if let Some(p) = &self.pending {
             self.render_pending(f, area, &p.title, p.progress);
+        }
+        if let Some(notice) = &self.result_notice {
+            notice.render(f, area);
         }
     }
 
@@ -662,17 +808,23 @@ impl VersionMgmt {
         let inner = Rect {
             x: r.x + 1,
             y: r.y + 1,
-            width: r.width - 2,
-            height: r.height - 2,
+            width: r.width.saturating_sub(2),
+            height: r.height.saturating_sub(2),
         };
         f.render_widget(block, r);
 
-        // Tail of the log bus for live progress. This is pre-wrapped every
-        // frame using the current popup width, so terminal resizes cannot
-        // leave the latest output below the clipped area.
-        let snap = log_bus::snapshot();
-        let lines = pending_log_lines(&snap, inner.width, inner.height);
-        f.render_widget(Paragraph::new(lines), inner);
+        let leading = [
+            Line::from(Span::styled(i18n::t("popup_please_wait"), theme::base())),
+            Line::from(""),
+        ];
+        let options = LogDisplayOptions {
+            range: LogRange::Tail((inner.height as usize).saturating_mul(8).max(32)),
+            viewport: LogViewportMode::Tail,
+            leading_lines: &leading,
+            min_log_rows: 1,
+            ..LogDisplayOptions::default()
+        };
+        self.pending_logs.render(f, inner, &LogBusSource, options);
     }
 
     fn split(area: Rect) -> (Rect, Rect) {
@@ -685,6 +837,12 @@ impl VersionMgmt {
 
     /// Handles a mouse event.
     pub fn on_mouse(&mut self, m: crossterm::event::MouseEvent, area: Rect, cfg: &Config) {
+        if let Some(notice) = &mut self.result_notice {
+            if matches!(notice.on_mouse(m, area), Some(NoticeOutcome::Close)) {
+                self.result_notice = None;
+            }
+            return;
+        }
         if self.is_busy() {
             return;
         }
@@ -699,6 +857,7 @@ impl VersionMgmt {
             if let Some(h) = (crate::widgets::tabs::Tabs {
                 items: &names,
                 selected: self.tab,
+                state: &self.tabs_state,
                 highlighted: None,
             })
             .hit(tabs_area, m.column)
@@ -785,6 +944,12 @@ impl VersionMgmt {
 
     /// Handles a key event.
     pub fn on_key(&mut self, code: KeyCode, cfg: &Config) {
+        if let Some(notice) = &mut self.result_notice {
+            if matches!(notice.on_key(code), Some(NoticeOutcome::Close)) {
+                self.result_notice = None;
+            }
+            return;
+        }
         if self.is_busy() {
             return;
         }
@@ -857,118 +1022,17 @@ impl VersionMgmt {
     }
 }
 
-fn pending_log_lines(snap: &[log_bus::LogLine], width: u16, height: u16) -> Vec<Line<'static>> {
-    let max_lines = height as usize;
-    if max_lines == 0 || width == 0 {
-        return Vec::new();
-    }
-
-    let mut log_lines = Vec::new();
-    for line in snap {
-        log_lines.extend(wrap_log_line(line, width as usize));
-    }
-
-    let show_notice = max_lines >= 3;
-    let log_budget = if show_notice {
-        max_lines.saturating_sub(2)
-    } else {
-        max_lines
-    };
-    let start = log_lines.len().saturating_sub(log_budget);
-
-    let mut lines = Vec::with_capacity(max_lines);
-    if show_notice {
-        lines.push(Line::from(Span::styled(
-            i18n::t("popup_please_wait"),
-            theme::base(),
-        )));
-        lines.push(Line::from(""));
-    }
-    lines.extend(log_lines[start..].iter().cloned());
-    lines
-}
-
-fn wrap_log_line(line: &log_bus::LogLine, width: usize) -> Vec<Line<'static>> {
-    if width == 0 {
-        return Vec::new();
-    }
-
-    let prefix = format!("{} [{}] ", line.ts, line.source);
-    let prefix_width = text::width(&prefix);
-
-    if prefix_width >= width {
-        return text::wrap_to_width(&format!("{prefix}{}", line.text), width)
-            .into_iter()
-            .map(Line::from)
-            .collect();
-    }
-
-    let body_width = width - prefix_width;
-    let wrapped = text::wrap_to_width(&line.text, body_width);
-    let indent = " ".repeat(prefix_width);
-
-    wrapped
-        .into_iter()
-        .enumerate()
-        .map(|(idx, part)| {
-            if idx == 0 {
-                Line::from(vec![
-                    Span::styled(format!("{} ", line.ts), theme::base()),
-                    Span::styled(format!("[{}] ", line.source), theme::accent()),
-                    Span::raw(part),
-                ])
-            } else {
-                Line::from(vec![Span::raw(indent.clone()), Span::raw(part)])
-            }
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn log(text: &str) -> log_bus::LogLine {
-        log_bus::LogLine {
-            ts: "00:00:00".to_string(),
-            source: "test".to_string(),
-            text: text.to_string(),
-        }
-    }
-
-    fn plain(line: &Line<'_>) -> String {
-        line.spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect()
-    }
-
     #[test]
-    fn pending_log_lines_keeps_tail_after_wrapping() {
-        let logs = vec![log(
-            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu",
-        )];
-        let wrapped = wrap_log_line(&logs[0], 28);
-        assert!(wrapped.len() > 3);
-
-        let lines = pending_log_lines(&logs, 28, 5);
-        let got: Vec<String> = lines.iter().skip(2).map(plain).collect();
-        let expected: Vec<String> = wrapped[wrapped.len() - 3..].iter().map(plain).collect();
-
-        assert_eq!(got, expected);
-    }
-
-    #[test]
-    fn tiny_popup_prioritizes_latest_log_lines_over_notice() {
-        let logs = vec![log(
-            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu",
-        )];
-        let wrapped = wrap_log_line(&logs[0], 28);
-
-        let lines = pending_log_lines(&logs, 28, 2);
-        let got: Vec<String> = lines.iter().map(plain).collect();
-        let expected: Vec<String> = wrapped[wrapped.len() - 2..].iter().map(plain).collect();
-
-        assert_eq!(got, expected);
+    fn failed_mutation_does_not_run_its_refresh_follow_up() {
+        let failure = TaskOutcome::failure("repo", "git", "exit 128");
+        assert!(!outcome_allows_follow_up(&failure));
+        assert!(outcome_allows_follow_up(&TaskOutcome::Success));
+        assert!(outcome_allows_follow_up(&TaskOutcome::PartialFailure(
+            vec![ItemFailure::new("repo", "pip", "failed"),]
+        )));
     }
 }

@@ -8,8 +8,8 @@ pub mod dropdown;
 pub mod focus_grid;
 /// Single-line text input widget.
 pub mod input;
-/// Scrollable log viewer widget.
-pub mod log_view;
+/// Data-source-independent, width-aware log display.
+pub mod log_display;
 /// Vertical menu list widget.
 pub mod menu;
 /// Modal popup widgets (confirm, input, menu, notice, select).

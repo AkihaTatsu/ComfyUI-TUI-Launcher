@@ -36,8 +36,8 @@ impl InputPopup {
         let inner = Rect {
             x: r.x + 1,
             y: r.y + 1,
-            width: r.width - 2,
-            height: 3,
+            width: r.width.saturating_sub(2),
+            height: r.height.saturating_sub(2).min(3),
         };
         self.input.render(f, inner, true);
     }

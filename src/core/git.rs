@@ -19,6 +19,27 @@ fn git_command() -> Command {
     cmd
 }
 
+/// Appends one command-scope Git config entry without overwriting URL mirror
+/// rules already encoded in `GIT_CONFIG_*` by `core::env`.
+fn append_runtime_config(
+    env: &mut HashMap<String, String>,
+    key: impl Into<String>,
+    value: impl Into<String>,
+) {
+    let index = env
+        .get("GIT_CONFIG_COUNT")
+        .and_then(|n| n.parse::<usize>().ok())
+        .unwrap_or(0);
+    env.insert(format!("GIT_CONFIG_KEY_{index}"), key.into());
+    env.insert(format!("GIT_CONFIG_VALUE_{index}"), value.into());
+    env.insert("GIT_CONFIG_COUNT".into(), (index + 1).to_string());
+}
+
+fn safe_directory_env(mut env: HashMap<String, String>) -> HashMap<String, String> {
+    append_runtime_config(&mut env, "safe.directory", "*");
+    env
+}
+
 /// Merges non-interactive safeguards into the caller-supplied environment.
 ///
 /// Without these, a `git fetch` against an auth-required remote can hang
@@ -43,10 +64,7 @@ fn no_prompt_env(mut env: HashMap<String, String>) -> HashMap<String, String> {
             "ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new".into(),
         );
     }
-    env.insert("GIT_CONFIG_COUNT".into(), "1".into());
-    env.insert("GIT_CONFIG_KEY_0".into(), "safe.directory".into());
-    env.insert("GIT_CONFIG_VALUE_0".into(), "*".into());
-    env
+    safe_directory_env(env)
 }
 use anyhow::Result;
 use std::path::Path;
@@ -281,7 +299,7 @@ pub fn checkout(
             .arg("checkout")
             .arg("--force")
             .arg(rev.to_string())
-            .envs(env.clone()),
+            .envs(safe_directory_env(env.clone())),
     )?;
     if !ok {
         // Hard-reset to the requested commit. Handles edge cases where
@@ -296,7 +314,7 @@ pub fn checkout(
                 .arg("reset")
                 .arg("--hard")
                 .arg(rev.to_string())
-                .envs(env),
+                .envs(safe_directory_env(env)),
         );
     }
     Ok(true)
@@ -319,7 +337,7 @@ pub fn reset_hard(
             .arg("reset")
             .arg("--hard")
             .arg(rev.to_string())
-            .envs(env),
+            .envs(safe_directory_env(env)),
     )
 }
 
@@ -463,5 +481,36 @@ pub fn current_release_tag(repo: &Path) -> Option<String> {
         Some(name)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod runtime_config_tests {
+    use super::*;
+
+    #[test]
+    fn safe_directory_is_appended_after_mirror_rules() {
+        let mut env = HashMap::new();
+        env.insert("GIT_CONFIG_COUNT".into(), "2".into());
+        env.insert("GIT_CONFIG_KEY_0".into(), "url.a.insteadOf".into());
+        env.insert("GIT_CONFIG_VALUE_0".into(), "https://a/".into());
+        env.insert("GIT_CONFIG_KEY_1".into(), "url.b.insteadOf".into());
+        env.insert("GIT_CONFIG_VALUE_1".into(), "https://b/".into());
+
+        let got = safe_directory_env(env);
+        assert_eq!(got.get("GIT_CONFIG_COUNT").map(String::as_str), Some("3"));
+        assert_eq!(
+            got.get("GIT_CONFIG_KEY_0").map(String::as_str),
+            Some("url.a.insteadOf")
+        );
+        assert_eq!(
+            got.get("GIT_CONFIG_KEY_1").map(String::as_str),
+            Some("url.b.insteadOf")
+        );
+        assert_eq!(
+            got.get("GIT_CONFIG_KEY_2").map(String::as_str),
+            Some("safe.directory")
+        );
+        assert_eq!(got.get("GIT_CONFIG_VALUE_2").map(String::as_str), Some("*"));
     }
 }
