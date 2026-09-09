@@ -158,3 +158,21 @@ fn value_to_string(v: &Value) -> String {
         _ => String::new(),
     }
 }
+
+#[cfg(test)]
+mod launcher_schema_tests {
+    use super::*;
+
+    #[test]
+    fn launcher_schema_contains_git_concurrency() {
+        let schema = load_launcher_or_init().expect("embedded launcher schema should parse");
+        let field = schema
+            .tabs
+            .iter()
+            .flat_map(|tab| &tab.fields)
+            .find(|field| field.key == "general.git_concurrency")
+            .expect("Git concurrency field should be present");
+        assert_eq!(field.default.as_str(), Some("1"));
+        assert!(matches!(field.ty, FieldType::Custom));
+    }
+}

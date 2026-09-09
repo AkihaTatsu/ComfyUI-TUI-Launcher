@@ -3,7 +3,7 @@
 //! Combines a URL-driven install field with the searchable ComfyUI-Manager
 //! extension catalog.
 
-use super::{TaskKind, TaskRequest, TaskResult, LIST_MAX_NUM};
+use super::{RepositoryAccess, TaskKind, TaskRequest, TaskResult, LIST_MAX_NUM};
 use crate::app::FlashKind;
 use crate::core::config::Config;
 use crate::core::extension_registry::{self, InstallStatus, RegistryEntry};
@@ -685,7 +685,9 @@ fn install_request(
         then: TaskKind::None,
         is_refresh: false,
         changes_repository: true,
+        repository_access: RepositoryAccess::Exclusive,
         work: Box::new(move |tx| {
+            super::warn_if_storage_low(&tx, &dest);
             if !git::clone(&url, &dest, env_vars.clone()).unwrap_or(false) {
                 return super::TaskOutcome::failure(
                     &url,
@@ -730,6 +732,7 @@ pub fn fetch_registry_request(env_vars: std::collections::HashMap<String, String
         then: TaskKind::None,
         is_refresh: true,
         changes_repository: false,
+        repository_access: RepositoryAccess::None,
         work: Box::new(move |tx| {
             match extension_registry::fetch_blocking(&env_vars) {
                 Ok(entries) => {

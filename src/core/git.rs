@@ -226,6 +226,142 @@ pub fn fetch(repo: &Path, env: std::collections::HashMap<String, String>) -> Res
     )
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ConnectivityStatus {
+    Intact,
+    MissingOrCorrupt,
+    Indeterminate(String),
+}
+
+fn connectivity_status(repo: &Path, env: HashMap<String, String>) -> Result<ConnectivityStatus> {
+    crate::core::log_bus::push(
+        "git",
+        format!(
+            "$ git -C {} fsck --connectivity-only --no-dangling",
+            repo.display()
+        ),
+    );
+    let output = git_command()
+        .arg("-C")
+        .arg(repo)
+        .arg("fsck")
+        .arg("--connectivity-only")
+        .arg("--no-dangling")
+        .envs(safe_directory_env(env))
+        // Keep classification stable even when the user's Git locale is not
+        // English. User-facing launcher text remains localised separately.
+        .env("LC_ALL", "C")
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for line in stdout.lines().chain(stderr.lines()) {
+        crate::core::log_bus::push("git", line);
+    }
+    if output.status.success() {
+        return Ok(ConnectivityStatus::Intact);
+    }
+
+    let diagnostics = format!("{stdout}\n{stderr}");
+    let lower = diagnostics.to_ascii_lowercase();
+    let confirmed_corruption = [
+        "missing blob",
+        "missing tree",
+        "missing commit",
+        "missing tag",
+        "broken link from",
+        "object corrupt or missing",
+        "is corrupt",
+        "object file",
+        "hash mismatch",
+        "invalid sha1 pointer",
+        "invalid object",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    if confirmed_corruption {
+        Ok(ConnectivityStatus::MissingOrCorrupt)
+    } else {
+        let detail = diagnostics
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("git fsck failed without diagnostics")
+            .trim()
+            .to_string();
+        Ok(ConnectivityStatus::Indeterminate(detail))
+    }
+}
+
+/// Checks that every object needed by reachable commits exists locally.
+/// Dangling objects are intentionally ignored because they are harmless and
+/// common after normal Git operations.
+#[cfg(test)]
+fn fsck_connectivity(repo: &Path, env: HashMap<String, String>) -> Result<bool> {
+    Ok(connectivity_status(repo, env)? == ConnectivityStatus::Intact)
+}
+
+/// Fetches all configured remotes without object negotiation, asking the
+/// remote to resend reachable objects even when local refs already advertise
+/// them. This is the non-destructive recovery path for missing Git objects.
+pub fn force_refetch(repo: &Path, env: HashMap<String, String>) -> Result<bool> {
+    run_logged(
+        "git",
+        Cmd::new("git")
+            .arg("-C")
+            .arg(repo.display().to_string())
+            .arg("fetch")
+            .arg("--all")
+            .arg("--refetch")
+            .envs(no_prompt_env(env)),
+    )
+}
+
+fn recover_missing_objects(repo: &Path, env: &HashMap<String, String>) -> Result<()> {
+    crate::core::log_bus::push(
+        "git",
+        format!(
+            "{}: reachable objects are missing; attempting one forced refetch",
+            repo.display()
+        ),
+    );
+    if !force_refetch(repo, env.clone())? {
+        anyhow::bail!(
+            "repository is corrupt and forced refetch failed (or this Git version does not support --refetch); upgrade Git or reinstall the repository"
+        );
+    }
+    match connectivity_status(repo, env.clone())? {
+        ConnectivityStatus::Intact => {}
+        ConnectivityStatus::MissingOrCorrupt => anyhow::bail!(
+            "repository still has missing objects after forced refetch; reinstall the repository"
+        ),
+        ConnectivityStatus::Indeterminate(detail) => anyhow::bail!(
+            "repository integrity could not be verified after forced refetch: {detail}"
+        ),
+    }
+    crate::core::log_bus::push(
+        "git",
+        format!("{}: repository object database recovered", repo.display()),
+    );
+    Ok(())
+}
+
+/// Fetches normally, then repairs a confirmed missing-object condition once.
+/// A clean connectivity check means the fetch failed for some other reason,
+/// so no high-write-volume refetch is attempted.
+pub fn fetch_with_recovery(repo: &Path, env: HashMap<String, String>) -> Result<()> {
+    if fetch(repo, env.clone())? {
+        return Ok(());
+    }
+    match connectivity_status(repo, env.clone())? {
+        ConnectivityStatus::Intact => anyhow::bail!(
+            "git fetch failed, but repository connectivity is intact; see the task log"
+        ),
+        ConnectivityStatus::MissingOrCorrupt => recover_missing_objects(repo, &env),
+        ConnectivityStatus::Indeterminate(detail) => anyhow::bail!(
+            "git fetch failed and repository corruption could not be confirmed: {detail}"
+        ),
+    }
+}
+
 /// Returns whether the local clone has a shallow-history boundary.
 ///
 /// A shallow clone caps `git log` at the boundary, so listing older
@@ -339,6 +475,48 @@ pub fn reset_hard(
             .arg(rev.to_string())
             .envs(safe_directory_env(env)),
     )
+}
+
+fn reset_to_available_upstream(repo: &Path, env: &HashMap<String, String>) -> Result<bool> {
+    let targets: &[&str] = if current_branch(repo).is_some() {
+        &["@{u}", "origin/HEAD", "FETCH_HEAD"]
+    } else {
+        &["origin/HEAD", "FETCH_HEAD"]
+    };
+    for target in targets {
+        if reset_hard(repo, target, env.clone())? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Brings a repository to its available upstream HEAD and performs one
+/// non-destructive object refetch when a connectivity check proves the local
+/// object database is incomplete.
+pub fn sync_to_upstream(repo: &Path, env: HashMap<String, String>) -> Result<()> {
+    fetch_with_recovery(repo, env.clone())?;
+    if reset_to_available_upstream(repo, &env)? {
+        return Ok(());
+    }
+
+    // A successful fetch can still leave a pre-existing missing object
+    // untouched because normal negotiation trusts the advertised refs. Only
+    // force a resend when fsck confirms that condition.
+    match connectivity_status(repo, env.clone())? {
+        ConnectivityStatus::Intact => {
+            anyhow::bail!("no upstream target could be reset; repository connectivity is intact")
+        }
+        ConnectivityStatus::MissingOrCorrupt => recover_missing_objects(repo, &env)?,
+        ConnectivityStatus::Indeterminate(detail) => anyhow::bail!(
+            "upstream reset failed and repository corruption could not be confirmed: {detail}"
+        ),
+    }
+    if reset_to_available_upstream(repo, &env)? {
+        Ok(())
+    } else {
+        anyhow::bail!("repository was recovered, but no upstream target could be reset")
+    }
 }
 
 /// Runs `git clone <url> <dest>` with non-interactive safeguards applied.
@@ -487,6 +665,33 @@ pub fn current_release_tag(repo: &Path) -> Option<String> {
 #[cfg(test)]
 mod runtime_config_tests {
     use super::*;
+    use std::ffi::OsStr;
+
+    fn run_git<I, S>(dir: &Path, args: I) -> std::process::Output
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("git command should start")
+    }
+
+    fn git_stdout<I, S>(dir: &Path, args: I) -> String
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let output = run_git(dir, args);
+        assert!(
+            output.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
 
     #[test]
     fn safe_directory_is_appended_after_mirror_rules() {
@@ -512,5 +717,65 @@ mod runtime_config_tests {
             Some("safe.directory")
         );
         assert_eq!(got.get("GIT_CONFIG_VALUE_2").map(String::as_str), Some("*"));
+    }
+
+    #[test]
+    fn sync_repairs_a_missing_reachable_object_without_recloning() {
+        let root = std::env::temp_dir().join(format!(
+            "comfyui-tui-git-recovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let source = root.join("source");
+        let origin = root.join("origin.git");
+        std::fs::create_dir_all(&source).unwrap();
+
+        git_stdout(&source, ["init", "-b", "main"]);
+        git_stdout(
+            &source,
+            ["config", "user.email", "launcher@example.invalid"],
+        );
+        git_stdout(&source, ["config", "user.name", "Launcher Test"]);
+        std::fs::write(source.join("tracked.txt"), "recover me\n").unwrap();
+        git_stdout(&source, ["add", "tracked.txt"]);
+        git_stdout(&source, ["commit", "-m", "initial"]);
+        git_stdout(
+            &root,
+            [
+                "clone",
+                "--bare",
+                source.to_str().unwrap(),
+                origin.to_str().unwrap(),
+            ],
+        );
+        git_stdout(
+            &source,
+            ["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git_stdout(&source, ["fetch", "origin"]);
+        git_stdout(&source, ["branch", "--set-upstream-to=origin/main", "main"]);
+
+        let blob = git_stdout(&source, ["rev-parse", "HEAD:tracked.txt"]);
+        let object = source
+            .join(".git")
+            .join("objects")
+            .join(&blob[..2])
+            .join(&blob[2..]);
+        assert!(object.is_file(), "test object should be loose");
+        std::fs::remove_file(&object).unwrap();
+        std::fs::remove_file(source.join("tracked.txt")).unwrap();
+        assert!(!fsck_connectivity(&source, HashMap::new()).unwrap());
+
+        sync_to_upstream(&source, HashMap::new()).expect("forced refetch should recover object");
+
+        assert_eq!(
+            std::fs::read_to_string(source.join("tracked.txt")).unwrap(),
+            "recover me\n"
+        );
+        assert!(fsck_connectivity(&source, HashMap::new()).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

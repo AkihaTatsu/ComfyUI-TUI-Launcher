@@ -4,7 +4,7 @@
 //! (change version, update, enable / disable, uninstall, open URL), and
 //! offers update-all and reinstall-all bulk operations.
 
-use super::{core_tab, TaskKind, TaskRequest, TaskResult, LIST_MAX_NUM};
+use super::{core_tab, RepositoryAccess, TaskKind, TaskRequest, TaskResult, LIST_MAX_NUM};
 use crate::app::FlashKind;
 use crate::core::config::Config;
 use crate::core::paths::ComfyDirs;
@@ -252,14 +252,26 @@ impl ExtensionsTab {
             let env_vars = env::build(&cfg.network);
             let python = cfg.general.python.clone();
             let root = PathBuf::from(&cfg.general.comfyui_dir);
-            return Some(update_all_request(items, root, env_vars, python));
+            return Some(update_all_request(
+                items,
+                root,
+                env_vars,
+                python,
+                cfg.general.git_concurrency,
+            ));
         }
         if self.btn_reinstall_all.poll_fire() {
             let items = self.items.clone();
             let env_vars = env::build(&cfg.network);
             let python = cfg.general.python.clone();
             let root = PathBuf::from(&cfg.general.comfyui_dir);
-            return Some(reinstall_all_request(items, root, env_vars, python));
+            return Some(reinstall_all_request(
+                items,
+                root,
+                env_vars,
+                python,
+                cfg.general.git_concurrency,
+            ));
         }
         None
     }
@@ -924,7 +936,13 @@ impl ExtensionsTab {
                     let items = self.items.clone();
                     let env_vars = env::build(&cfg.network);
                     let python = cfg.general.python.clone();
-                    return Some(update_all_request(items, root, env_vars, python));
+                    return Some(update_all_request(
+                        items,
+                        root,
+                        env_vars,
+                        python,
+                        cfg.general.git_concurrency,
+                    ));
                 }
                 _ => return None,
             }
@@ -957,7 +975,13 @@ impl ExtensionsTab {
                     let items = self.items.clone();
                     let env_vars = env::build(&cfg.network);
                     let python = cfg.general.python.clone();
-                    return Some(reinstall_all_request(items, root, env_vars, python));
+                    return Some(reinstall_all_request(
+                        items,
+                        root,
+                        env_vars,
+                        python,
+                        cfg.general.git_concurrency,
+                    ));
                 }
                 _ => return None,
             }
@@ -991,6 +1015,7 @@ impl ExtensionsTab {
                             root,
                             new_limit,
                             env::build(&cfg.network),
+                            cfg.general.git_concurrency,
                         ));
                     }
                     self.grid.move_down();
@@ -1001,7 +1026,12 @@ impl ExtensionsTab {
             }
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 let limit = self.limit;
-                Some(local_load_request(root, limit, env::build(&cfg.network)))
+                Some(local_load_request(
+                    root,
+                    limit,
+                    env::build(&cfg.network),
+                    cfg.general.git_concurrency,
+                ))
             }
             KeyCode::Char('d') | KeyCode::Char('D') => {
                 if let Some(real) = self.current_real_idx() {
@@ -1221,18 +1251,21 @@ pub fn load_request_with_limit(
     root: PathBuf,
     limit: usize,
     env_vars: std::collections::HashMap<String, String>,
+    git_concurrency: usize,
 ) -> TaskRequest {
     TaskRequest {
         title: i18n::t("task_ext_load"),
         then: TaskKind::None,
         is_refresh: true,
         changes_repository: false,
+        repository_access: RepositoryAccess::Exclusive,
         work: Box::new(move |tx| {
             use std::sync::{
                 atomic::{AtomicUsize, Ordering},
                 mpsc as inner_mpsc, Arc,
             };
             let dirs = ComfyDirs::new(&root);
+            super::warn_if_storage_low(&tx, &root);
             let custom = dirs.custom_nodes();
             // First pass: enumerate cheaply so `total` is known up front
             // for the progress denominator. Second pass: parallel git work.
@@ -1275,12 +1308,12 @@ pub fn load_request_with_limit(
             }
 
             // Parallel git fetch + info collection. Chunk-disjoint partition
-            // across SCAN_WORKERS threads; each thread bumps a shared counter
+            // across the configured worker count; each thread bumps a shared counter
             // and emits Progress. Results stream back via a separate channel.
-            let workers = SCAN_WORKERS.min(total).max(1);
+            let workers = worker_count(git_concurrency, total);
             let chunk = total.div_ceil(workers);
             let done = Arc::new(AtomicUsize::new(0));
-            let (res_tx, res_rx) = inner_mpsc::channel::<Extension>();
+            let (res_tx, res_rx) = inner_mpsc::channel::<(Extension, Option<super::ItemFailure>)>();
             let mut handles = Vec::with_capacity(workers);
             for c in entries.chunks(chunk) {
                 let mine: Vec<_> = c.to_vec();
@@ -1290,9 +1323,19 @@ pub fn load_request_with_limit(
                 let res_tx = res_tx.clone();
                 handles.push(std::thread::spawn(move || {
                     for (p, logical, disabled, managed) in mine {
-                        if managed {
-                            let _ = git::fetch(&p, env.clone());
-                        }
+                        let fetch_failure = if managed {
+                            git::fetch_with_recovery(&p, env.clone())
+                                .err()
+                                .map(|error| {
+                                    super::ItemFailure::new(
+                                        &logical,
+                                        "git fetch",
+                                        error.to_string(),
+                                    )
+                                })
+                        } else {
+                            None
+                        };
                         let remote = if managed {
                             git::remote_url(&p).unwrap_or_default()
                         } else {
@@ -1317,26 +1360,37 @@ pub fn load_request_with_limit(
                             String::new()
                         };
                         let behind = if managed { git::behind_upstream(&p) } else { 0 };
-                        let _ = res_tx.send(Extension {
-                            name: logical,
-                            path: p,
-                            disabled,
-                            managed,
-                            remote,
-                            branch,
-                            head,
-                            head_date,
-                            behind,
-                        });
+                        let _ = res_tx.send((
+                            Extension {
+                                name: logical,
+                                path: p,
+                                disabled,
+                                managed,
+                                remote,
+                                branch,
+                                head,
+                                head_date,
+                                behind,
+                            },
+                            fetch_failure,
+                        ));
                         let now = done.fetch_add(1, Ordering::SeqCst) + 1;
                         let _ = progress_tx.send(TaskResult::Progress { done: now, total });
                     }
                 }));
             }
             drop(res_tx);
-            let mut out: Vec<Extension> = res_rx.iter().collect();
+            let results: Vec<(Extension, Option<super::ItemFailure>)> = res_rx.iter().collect();
             for h in handles {
                 let _ = h.join();
+            }
+            let mut failures = Vec::new();
+            let mut out = Vec::with_capacity(results.len());
+            for (extension, failure) in results {
+                out.push(extension);
+                if let Some(failure) = failure {
+                    failures.push(failure);
+                }
             }
             out.sort_by(|a, b| a.name.cmp(&b.name));
             let _ = tx.send(TaskResult::ExtData {
@@ -1344,7 +1398,11 @@ pub fn load_request_with_limit(
                 root,
                 requested_limit: limit,
             });
-            super::TaskOutcome::Success
+            if failures.is_empty() {
+                super::TaskOutcome::Success
+            } else {
+                super::TaskOutcome::PartialFailure(failures)
+            }
         }),
     }
 }
@@ -1355,17 +1413,20 @@ pub fn local_load_request(
     root: PathBuf,
     limit: usize,
     env_vars: std::collections::HashMap<String, String>,
+    git_concurrency: usize,
 ) -> TaskRequest {
     let then = TaskKind::ExtLoad {
         root: root.clone(),
         env: env_vars,
         limit,
+        git_concurrency,
     };
     TaskRequest {
         title: i18n::t("task_ext_load"),
         then,
         is_refresh: true,
         changes_repository: false,
+        repository_access: RepositoryAccess::None,
         work: Box::new(move |tx| {
             let items = scan_local(&root, limit);
             let _ = tx.send(TaskResult::ExtData {
@@ -1378,13 +1439,11 @@ pub fn local_load_request(
     }
 }
 
-/// Cap on parallel git workers for the scan / Update All / Reinstall All
-/// tasks. Windows process creation and console I/O are substantially more
-/// expensive, so use a smaller bound there.
-#[cfg(windows)]
-const SCAN_WORKERS: usize = 4;
-#[cfg(not(windows))]
-const SCAN_WORKERS: usize = 8;
+fn worker_count(configured: usize, total: usize) -> usize {
+    configured
+        .clamp(1, crate::core::config::MAX_GIT_CONCURRENCY)
+        .min(total.max(1))
+}
 
 pub(super) fn update_one_request(
     path: PathBuf,
@@ -1399,8 +1458,10 @@ pub(super) fn update_one_request(
         then: TaskKind::None,
         is_refresh: false,
         changes_repository: true,
+        repository_access: RepositoryAccess::Exclusive,
         work: Box::new(move |tx| {
-            if let Err(e) = sync_to_upstream(&path, &env_vars) {
+            super::warn_if_storage_low(&tx, &path);
+            if let Err(e) = git::sync_to_upstream(&path, env_vars.clone()) {
                 return super::TaskOutcome::failure(name, "git sync", e.to_string());
             }
             let mut failures = Vec::new();
@@ -1436,43 +1497,12 @@ pub(super) fn update_one_request(
     }
 }
 
-/// Bring a single extension repo to its upstream HEAD reliably — works for
-/// detached-HEAD repos (from prior Change Version) and for repos with
-/// uncommitted local edits (ComfyUI custom nodes often write config files
-/// into their own dirs, which makes `git pull --ff-only` refuse). Strategy:
-///   1. `git fetch --all` so refs are current.
-///   2. Pick the target ref: upstream of current branch (`@{u}`) if we're on
-///      a branch, otherwise whatever was just fetched (`FETCH_HEAD`).
-///   3. `git reset --hard <target>` — discards local edits to tracked files;
-///      untracked files (user data) are left alone.
-fn sync_to_upstream(
-    path: &std::path::Path,
-    env_vars: &std::collections::HashMap<String, String>,
-) -> anyhow::Result<()> {
-    if !git::fetch(path, env_vars.clone())? {
-        anyhow::bail!("git fetch failed; see the task log");
-    }
-    // Prefer `@{u}` on a branch, then retain fallbacks for repositories whose
-    // branch has no configured upstream. Detached HEAD begins directly with
-    // `origin/HEAD`; `FETCH_HEAD` covers a missing remote-default symref.
-    let targets: &[&str] = if git::current_branch(path).is_some() {
-        &["@{u}", "origin/HEAD", "FETCH_HEAD"]
-    } else {
-        &["origin/HEAD", "FETCH_HEAD"]
-    };
-    for t in targets {
-        if git::reset_hard(path, t, env_vars.clone()).unwrap_or(false) {
-            return Ok(());
-        }
-    }
-    anyhow::bail!("no upstream target could be reset; see the task log")
-}
-
 fn update_all_request(
     items: Vec<Extension>,
     root: PathBuf,
     env_vars: std::collections::HashMap<String, String>,
     python: String,
+    git_concurrency: usize,
 ) -> TaskRequest {
     bulk_sync_request(
         i18n::t("task_ext_update_all"),
@@ -1480,6 +1510,7 @@ fn update_all_request(
         root,
         env_vars,
         python,
+        git_concurrency,
     )
 }
 
@@ -1492,18 +1523,22 @@ fn bulk_sync_request(
     root: PathBuf,
     env_vars: std::collections::HashMap<String, String>,
     python: String,
+    git_concurrency: usize,
 ) -> TaskRequest {
     let then = TaskKind::ExtLoad {
         root: root.clone(),
         env: env_vars.clone(),
         limit: super::LIST_MAX_NUM,
+        git_concurrency,
     };
     TaskRequest {
         title,
         then,
         is_refresh: false,
         changes_repository: true,
+        repository_access: RepositoryAccess::Exclusive,
         work: Box::new(move |tx| {
+            super::warn_if_storage_low(&tx, &root);
             let managed: Vec<Extension> = items.into_iter().filter(|e| e.managed).collect();
             let total = managed.len();
             let _ = tx.send(TaskResult::Progress { done: 0, total });
@@ -1511,7 +1546,7 @@ fn bulk_sync_request(
                 return super::TaskOutcome::Success;
             }
 
-            let workers = SCAN_WORKERS.min(total).max(1);
+            let workers = worker_count(git_concurrency, total);
             let chunk = total.div_ceil(workers);
             let (result_tx, result_rx) = std::sync::mpsc::channel();
             let mut handles = Vec::with_capacity(workers);
@@ -1521,7 +1556,8 @@ fn bulk_sync_request(
                 let result_tx = result_tx.clone();
                 handles.push(std::thread::spawn(move || {
                     for ext in entries {
-                        let result = sync_to_upstream(&ext.path, &env).map_err(|e| e.to_string());
+                        let result = git::sync_to_upstream(&ext.path, env.clone())
+                            .map_err(|e| e.to_string());
                         let _ = result_tx.send((ext, result));
                     }
                 }));
@@ -1607,9 +1643,11 @@ fn list_versions_request_n(
         then: TaskKind::None,
         is_refresh: false,
         changes_repository: false,
+        repository_access: RepositoryAccess::Exclusive,
         work: Box::new(move |tx| {
-            let _ = git::fetch(&path, env_vars.clone());
-            let _ = git::deepen_until_full(&path, env_vars);
+            super::warn_if_storage_low(&tx, &path);
+            let fetch_result = git::fetch_with_recovery(&path, env_vars.clone());
+            let deepen_ok = fetch_result.is_ok() && git::deepen_until_full(&path, env_vars);
             let commits = git::log_all(&path, limit).unwrap_or_default();
             let current = git::current_commit(&path);
             let _ = tx.send(TaskResult::ExtCommits {
@@ -1618,7 +1656,21 @@ fn list_versions_request_n(
                 current,
                 requested_limit: limit,
             });
-            super::TaskOutcome::Success
+            match fetch_result {
+                Err(error) => super::TaskOutcome::PartialFailure(vec![super::ItemFailure::new(
+                    &name,
+                    "git fetch",
+                    error.to_string(),
+                )]),
+                Ok(()) if !deepen_ok => {
+                    super::TaskOutcome::PartialFailure(vec![super::ItemFailure::new(
+                        &name,
+                        "git fetch",
+                        "repository history could not be fully fetched; see the task log",
+                    )])
+                }
+                Ok(()) => super::TaskOutcome::Success,
+            }
         }),
     }
 }
@@ -1637,7 +1689,9 @@ fn checkout_ext_request(
         then: TaskKind::None,
         is_refresh: false,
         changes_repository: true,
+        repository_access: RepositoryAccess::Exclusive,
         work: Box::new(move |tx| {
+            super::warn_if_storage_low(&tx, &path);
             if !git::checkout(&path, &rev, env_vars.clone()).unwrap_or(false) {
                 return super::TaskOutcome::failure(
                     &name,
@@ -1700,7 +1754,9 @@ fn uninstall_request(path: PathBuf, _root: PathBuf, name: String) -> TaskRequest
         then: TaskKind::None,
         is_refresh: false,
         changes_repository: true,
+        repository_access: RepositoryAccess::Exclusive,
         work: Box::new(move |tx| {
+            super::warn_if_storage_low(&tx, &path);
             if let Err(e) = std::fs::remove_dir_all(&path) {
                 return super::TaskOutcome::failure(&name, "uninstall", e.to_string());
             }
@@ -1728,7 +1784,9 @@ fn toggle_enabled_request(
         then: TaskKind::None,
         is_refresh: false,
         changes_repository: true,
+        repository_access: RepositoryAccess::Exclusive,
         work: Box::new(move |tx| {
+            super::warn_if_storage_low(&tx, &path);
             let new_path = if currently_disabled {
                 // Strip trailing ".disabled"
                 let raw = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
@@ -1777,6 +1835,7 @@ fn reinstall_all_request(
     root: PathBuf,
     env_vars: std::collections::HashMap<String, String>,
     python: String,
+    git_concurrency: usize,
 ) -> TaskRequest {
     bulk_sync_request(
         i18n::t("task_ext_reinstall_all"),
@@ -1784,6 +1843,7 @@ fn reinstall_all_request(
         root,
         env_vars,
         python,
+        git_concurrency,
     )
 }
 
@@ -1829,7 +1889,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        let request = load_request_with_limit(root.clone(), 10, Default::default());
+        let request = load_request_with_limit(root.clone(), 10, Default::default(), 1);
         let (tx, rx) = std::sync::mpsc::channel();
         let outcome = (request.work)(tx);
         assert!(matches!(outcome, super::super::TaskOutcome::Success));
@@ -1838,5 +1898,14 @@ mod tests {
             TaskResult::ExtData { items, .. } if items.is_empty()
         )));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worker_count_honours_configuration_and_work_size() {
+        assert_eq!(worker_count(0, 12), 1);
+        assert_eq!(worker_count(1, 12), 1);
+        assert_eq!(worker_count(8, 3), 3);
+        assert_eq!(worker_count(usize::MAX, 100), 32);
+        assert_eq!(worker_count(8, 0), 1);
     }
 }

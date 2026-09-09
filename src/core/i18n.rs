@@ -99,3 +99,29 @@ pub fn t_args(key: &str, args: &[(&str, &str)]) -> String {
     }
     s
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_embedded_locale_parses_and_has_storage_keys() {
+        for (code, text) in LOCALES {
+            let catalogue: HashMap<String, String> = toml::from_str(text)
+                .unwrap_or_else(|error| panic!("locale {code} is invalid TOML: {error}"));
+            for key in [
+                "setting_git_concurrency",
+                "setting_git_concurrency_desc",
+                "task_waiting_repository",
+                "storage_warning",
+                "storage_warning_space",
+                "storage_warning_files",
+            ] {
+                assert!(
+                    catalogue.contains_key(key),
+                    "locale {code} is missing {key}"
+                );
+            }
+        }
+    }
+}

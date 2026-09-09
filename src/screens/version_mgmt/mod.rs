@@ -24,7 +24,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders};
 use ratatui::Frame;
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 
@@ -42,17 +42,29 @@ pub struct TaskRequest {
     pub work: Box<dyn FnOnce(mpsc::Sender<TaskResult>) -> TaskOutcome + Send + 'static>,
     /// Follow-up task queued after this one completes.
     pub then: TaskKind,
-    /// Whether this is a read-only refresh task.
+    /// Whether this task uses the non-modal refresh presentation.
     ///
     /// Refresh tasks run in the background with progress in the top-right
-    /// banner instead of the blocking working popup. Only one refresh
-    /// runs at a time; manual triggers drop silently while busy, and auto
-    /// triggers are queued.
+    /// banner instead of the blocking working popup. A refresh may still run
+    /// `git fetch`; `repository_access` independently controls exclusion.
     pub is_refresh: bool,
     /// Whether successful completion may have changed a repository or
     /// extension on disk. Some read-only tasks are modal but must not
     /// invalidate repository snapshots or display a mutation-success banner.
     pub changes_repository: bool,
+    /// Whether this task performs Git or repository-tree writes that must not
+    /// overlap another top-level repository task.
+    pub repository_access: RepositoryAccess,
+}
+
+/// Scheduling class for operations that touch repositories on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepositoryAccess {
+    /// Pure local reads or unrelated network/cache work.
+    None,
+    /// Git writes or repository-tree mutations. Only one such top-level task
+    /// runs at once; a batch may still use its configured internal workers.
+    Exclusive,
 }
 
 /// Identifier for a follow-up task to queue after the current one finishes.
@@ -71,6 +83,7 @@ pub enum TaskKind {
         root: PathBuf,
         env: std::collections::HashMap<String, String>,
         limit: usize,
+        git_concurrency: usize,
     },
 }
 
@@ -132,6 +145,8 @@ pub enum TaskResult {
         /// Total items to process.
         total: usize,
     },
+    /// Non-fatal warning emitted while a task continues running.
+    Warning { message: String },
     /// Surgical update of one extension row after a single-entry mutation.
     ///
     /// `old_path` matches the row to be replaced; `ext` is the freshly
@@ -166,6 +181,53 @@ pub enum TaskResult {
     /// events. Unlike channel disconnect, this distinguishes success,
     /// partial success, and a real failure.
     Finished(TaskOutcome),
+}
+
+/// Emits one filesystem-agnostic, non-blocking storage warning before a
+/// write-heavy operation. Callers continue regardless of the probe result.
+pub fn warn_if_storage_low(tx: &mpsc::Sender<TaskResult>, path: &Path) {
+    let snapshot = match crate::core::storage::inspect(path) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            log_bus::push(
+                "storage",
+                format!("could not inspect storage near {}: {error}", path.display()),
+            );
+            return;
+        }
+    };
+    let pressure = snapshot.pressure();
+    if !pressure.any() {
+        return;
+    }
+
+    let mut details = Vec::new();
+    if pressure.bytes {
+        let available = crate::core::storage::format_bytes(snapshot.available_bytes);
+        let percent = format!("{:.2}", snapshot.available_bytes_percent());
+        details.push(i18n::t_args(
+            "storage_warning_space",
+            &[("available", &available), ("percent", &percent)],
+        ));
+    }
+    if pressure.file_slots {
+        if let (Some(available), Some(percent)) = (
+            snapshot.available_file_slots,
+            snapshot.available_file_slots_percent(),
+        ) {
+            let available = available.to_string();
+            let percent = format!("{percent:.2}");
+            details.push(i18n::t_args(
+                "storage_warning_files",
+                &[("available", &available), ("percent", &percent)],
+            ));
+        }
+    }
+    let path = snapshot.path.display().to_string();
+    let details = details.join("; ");
+    let message = i18n::t_args("storage_warning", &[("path", &path), ("details", &details)]);
+    log_bus::push("storage", &message);
+    let _ = tx.send(TaskResult::Warning { message });
 }
 
 /// One failed item/stage inside a task.
@@ -220,6 +282,8 @@ struct PendingTask {
     then: TaskKind,
     progress: Option<(usize, usize)>,
     changes_repository: bool,
+    repository_access: RepositoryAccess,
+    warnings: Vec<String>,
 }
 
 /// Version management screen state.
@@ -243,6 +307,9 @@ pub struct VersionMgmt {
     /// FIFO of automatic refreshes, promoted into `refresh` as each prior
     /// request finishes. Manual refreshes bypass this queue.
     queued_refresh: VecDeque<TaskRequest>,
+    /// A user mutation waiting for a background Git-writing refresh to finish.
+    /// Input is blocked while present, so this queue is intentionally one deep.
+    queued_mutation: Option<TaskRequest>,
     /// Persistent result popup for failed/partially failed mutations.
     result_notice: Option<Notice>,
     /// Shared tail-following log display used by the blocking task popup.
@@ -269,6 +336,7 @@ impl VersionMgmt {
             pending: None,
             refresh: None,
             queued_refresh: VecDeque::new(),
+            queued_mutation: None,
             result_notice: None,
             pending_logs: LogDisplay::new(),
             task_flash: None,
@@ -284,7 +352,7 @@ impl VersionMgmt {
     /// Background refresh state is not included because it does not
     /// block input.
     pub fn is_busy(&self) -> bool {
-        self.pending.is_some()
+        self.pending.is_some() || self.queued_mutation.is_some()
     }
 
     /// Drains transient flash messages from the Extensions and Install
@@ -340,8 +408,28 @@ impl VersionMgmt {
         // Progress updates to the slot they came from.
         changed |= self.drain_slot(true);
         changed |= self.drain_slot(false);
-        // Promote any queued auto-refresh into the now-free slot.
-        if self.refresh.is_none() {
+        // A user mutation takes priority once the active repository-writing
+        // refresh releases its exclusive slot.
+        if self.pending.is_none()
+            && self
+                .queued_mutation
+                .as_ref()
+                .is_some_and(|req| !self.repository_conflict(req.repository_access))
+        {
+            if let Some(req) = self.queued_mutation.take() {
+                self.spawn_inner(req);
+                changed = true;
+            }
+        }
+        // Promote an automatic refresh only when it does not conflict with a
+        // running task or a user mutation waiting ahead of it.
+        if self.refresh.is_none()
+            && self.queued_mutation.is_none()
+            && self
+                .queued_refresh
+                .front()
+                .is_some_and(|req| !self.repository_conflict(req.repository_access))
+        {
             if let Some(req) = self.queued_refresh.pop_front() {
                 self.spawn_inner(req);
                 changed = true;
@@ -372,6 +460,7 @@ impl VersionMgmt {
                             root,
                             LIST_MAX_NUM,
                             env_vars,
+                            cfg.general.git_concurrency,
                         ));
                         changed = true;
                     }
@@ -384,6 +473,7 @@ impl VersionMgmt {
                             root,
                             LIST_MAX_NUM,
                             env_vars,
+                            cfg.general.git_concurrency,
                         ));
                         changed = true;
                     }
@@ -414,7 +504,8 @@ impl VersionMgmt {
         }
         let mut changed = false;
         let mut to_apply: Vec<TaskResult> = Vec::new();
-        let mut finished: Option<(TaskKind, TaskOutcome, bool)> = None;
+        let mut finished: Option<(TaskKind, TaskOutcome, bool, Vec<String>)> = None;
+        let mut new_warnings = Vec::new();
         if let Some(p) = slot {
             loop {
                 match p.rx.try_recv() {
@@ -423,8 +514,18 @@ impl VersionMgmt {
                         changed = true;
                     }
                     Ok(TaskResult::Finished(outcome)) => {
-                        finished = Some((p.then.clone(), outcome, p.changes_repository));
+                        finished = Some((
+                            p.then.clone(),
+                            outcome,
+                            p.changes_repository,
+                            p.warnings.clone(),
+                        ));
                         break;
+                    }
+                    Ok(TaskResult::Warning { message }) => {
+                        p.warnings.push(message.clone());
+                        new_warnings.push(message);
+                        changed = true;
                     }
                     Ok(res) => to_apply.push(res),
                     Err(mpsc::TryRecvError::Empty) => break,
@@ -437,6 +538,7 @@ impl VersionMgmt {
                                 "background worker ended without a result",
                             ),
                             p.changes_repository,
+                            p.warnings.clone(),
                         ));
                         break;
                     }
@@ -447,14 +549,17 @@ impl VersionMgmt {
             self.apply_result(r);
             changed = true;
         }
-        if let Some((then, outcome, changes_repository)) = finished {
+        if let Some(message) = new_warnings.last() {
+            self.task_flash = Some((crate::app::FlashKind::Warning, message.clone()));
+        }
+        if let Some((then, outcome, changes_repository, warnings)) = finished {
             if for_refresh {
                 self.refresh = None;
             } else {
                 self.pending = None;
             }
             let run_follow_up = outcome_allows_follow_up(&outcome);
-            self.handle_outcome(for_refresh, changes_repository, outcome);
+            self.handle_outcome(for_refresh, changes_repository, outcome, warnings);
             if run_follow_up {
                 self.queue_kind(then);
             }
@@ -463,11 +568,21 @@ impl VersionMgmt {
         changed
     }
 
-    fn handle_outcome(&mut self, for_refresh: bool, changed: bool, outcome: TaskOutcome) {
+    fn handle_outcome(
+        &mut self,
+        for_refresh: bool,
+        changed: bool,
+        outcome: TaskOutcome,
+        warnings: Vec<String>,
+    ) {
         match outcome {
             TaskOutcome::Success => {
                 if !for_refresh && changed {
                     self.repo_changed = true;
+                }
+                if let Some(message) = warnings.last() {
+                    self.task_flash = Some((crate::app::FlashKind::Warning, message.clone()));
+                } else if !for_refresh && changed {
                     self.task_flash =
                         Some((crate::app::FlashKind::Info, i18n::t("task_result_success")));
                 }
@@ -476,7 +591,7 @@ impl VersionMgmt {
                 if changed {
                     self.repo_changed = true;
                 }
-                self.show_task_failures(true, failures);
+                self.show_task_failures(true, failures, &warnings);
             }
             TaskOutcome::Failure(failures) => {
                 if for_refresh {
@@ -485,14 +600,20 @@ impl VersionMgmt {
                         .map(|f| format!("{}: {}", f.stage, f.message))
                         .unwrap_or_else(|| i18n::t("task_result_failed"));
                     log_bus::push("task", format!("refresh failed: {message}"));
+                    self.task_flash = Some((crate::app::FlashKind::Error, message));
                 } else {
-                    self.show_task_failures(false, failures);
+                    self.show_task_failures(false, failures, &warnings);
                 }
             }
         }
     }
 
-    fn show_task_failures(&mut self, partial: bool, failures: Vec<ItemFailure>) {
+    fn show_task_failures(
+        &mut self,
+        partial: bool,
+        failures: Vec<ItemFailure>,
+        warnings: &[String],
+    ) {
         let title = if partial {
             i18n::t("task_result_partial")
         } else {
@@ -510,6 +631,9 @@ impl VersionMgmt {
         }
         if failures.len() > 12 {
             body.push_str(&format!("\n… +{}", failures.len() - 12));
+        }
+        for warning in warnings {
+            body.push_str(&format!("\n\n⚠ {warning}"));
         }
         if let Some(path) = log_bus::file_path() {
             body.push_str(&format!("\n\n{}", path.display()));
@@ -571,6 +695,9 @@ impl VersionMgmt {
             // Progress is consumed inside `drain_slot`; reaching
             // `apply_result` is a no-op fallback.
             TaskResult::Progress { .. } => {}
+            // Warnings are consumed inside `drain_slot` so they remain tied
+            // to the task's final outcome.
+            TaskResult::Warning { .. } => {}
             TaskResult::ExtRowUpdate { old_path, ext } => {
                 if let Some(i) = self.ext.items.iter().position(|e| e.path == old_path) {
                     self.ext.items[i] = ext;
@@ -683,10 +810,34 @@ impl VersionMgmt {
             TaskKind::CoreLoad { root, env, limit } => {
                 self.spawn_auto(core_tab::load_request_with_env(root, env, limit));
             }
-            TaskKind::ExtLoad { root, env, limit } => {
-                self.spawn_auto(extensions_tab::load_request_with_limit(root, limit, env));
+            TaskKind::ExtLoad {
+                root,
+                env,
+                limit,
+                git_concurrency,
+            } => {
+                self.spawn_auto(extensions_tab::load_request_with_limit(
+                    root,
+                    limit,
+                    env,
+                    git_concurrency,
+                ));
             }
         }
+    }
+
+    fn repository_task_active(&self) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|task| task.repository_access == RepositoryAccess::Exclusive)
+            || self
+                .refresh
+                .as_ref()
+                .is_some_and(|task| task.repository_access == RepositoryAccess::Exclusive)
+    }
+
+    fn repository_conflict(&self, access: RepositoryAccess) -> bool {
+        access == RepositoryAccess::Exclusive && self.repository_task_active()
     }
 
     /// Manual dispatch from a user key or click.
@@ -695,22 +846,29 @@ impl VersionMgmt {
     /// dropped silently when a refresh is already running.
     fn spawn(&mut self, req: TaskRequest) {
         if req.is_refresh {
-            if self.refresh.is_some() {
+            if self.refresh.is_some() || self.repository_conflict(req.repository_access) {
                 return;
             }
             self.spawn_inner(req);
-        } else if self.pending.is_none() {
+        } else if self.pending.is_none() && !self.repository_conflict(req.repository_access) {
             self.spawn_inner(req);
+        } else if self.queued_mutation.is_none() {
+            log_bus::push("task", format!("queued: {}", req.title));
+            self.queued_mutation = Some(req);
         }
     }
 
     /// Auto dispatch from `tick` or a chained `then`.
     ///
-    /// Refresh tasks landing on a busy slot are queued one deep.
+    /// Refresh tasks landing on a busy slot are queued.
     /// Mutations never use this path.
     fn spawn_auto(&mut self, req: TaskRequest) {
         if req.is_refresh {
-            if self.refresh.is_some() {
+            if self.refresh.is_some()
+                || self.repository_conflict(req.repository_access)
+                || (self.queued_mutation.is_some()
+                    && req.repository_access == RepositoryAccess::Exclusive)
+            {
                 self.queued_refresh.push_back(req);
                 return;
             }
@@ -735,6 +893,8 @@ impl VersionMgmt {
             then: req.then,
             progress: None,
             changes_repository: req.changes_repository,
+            repository_access: req.repository_access,
+            warnings: Vec::new(),
         };
         if req.is_refresh {
             self.refresh = Some(task);
@@ -776,6 +936,9 @@ impl VersionMgmt {
         }
         if let Some(p) = &self.pending {
             self.render_pending(f, area, &p.title, p.progress);
+        } else if let Some(req) = &self.queued_mutation {
+            let title = i18n::t_args("task_waiting_repository", &[("title", &req.title)]);
+            self.render_pending(f, area, &title, None);
         }
         if let Some(notice) = &self.result_notice {
             notice.render(f, area);
@@ -1025,6 +1188,8 @@ impl VersionMgmt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn failed_mutation_does_not_run_its_refresh_follow_up() {
@@ -1034,5 +1199,53 @@ mod tests {
         assert!(outcome_allows_follow_up(&TaskOutcome::PartialFailure(
             vec![ItemFailure::new("repo", "pip", "failed"),]
         )));
+    }
+
+    #[test]
+    fn mutation_waits_for_repository_writing_refresh() {
+        let mut screen = VersionMgmt::new();
+        let (release_tx, release_rx) = mpsc::channel();
+        screen.spawn_auto(TaskRequest {
+            title: "repository refresh".into(),
+            work: Box::new(move |_| {
+                let _ = release_rx.recv();
+                TaskOutcome::Success
+            }),
+            then: TaskKind::None,
+            is_refresh: true,
+            changes_repository: false,
+            repository_access: RepositoryAccess::Exclusive,
+        });
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_in_task = ran.clone();
+        screen.spawn(TaskRequest {
+            title: "manual update".into(),
+            work: Box::new(move |_| {
+                ran_in_task.store(true, Ordering::SeqCst);
+                TaskOutcome::Success
+            }),
+            then: TaskKind::None,
+            is_refresh: false,
+            changes_repository: true,
+            repository_access: RepositoryAccess::Exclusive,
+        });
+
+        assert!(screen.refresh.is_some());
+        assert!(screen.pending.is_none());
+        assert!(screen.queued_mutation.is_some());
+        assert!(screen.is_busy());
+        assert!(!ran.load(Ordering::SeqCst));
+
+        release_tx.send(()).unwrap();
+        let cfg = Config::default();
+        for _ in 0..1000 {
+            screen.tick(&cfg);
+            if ran.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(ran.load(Ordering::SeqCst));
     }
 }

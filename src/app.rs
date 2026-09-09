@@ -161,6 +161,8 @@ pub struct App {
 pub enum FlashKind {
     /// Informational banner styled with the accent colour.
     Info,
+    /// Non-fatal warning banner styled in yellow.
+    Warning,
     /// Error banner styled with the danger colour.
     Error,
 }
@@ -240,6 +242,11 @@ impl App {
         self.set_flash_temp(msg, FlashKind::Error);
     }
 
+    /// Sets the transient non-fatal warning banner.
+    pub fn set_flash_warning(&mut self, msg: impl Into<String>) {
+        self.set_flash_temp(msg, FlashKind::Warning);
+    }
+
     fn set_flash_temp(&mut self, msg: impl Into<String>, kind: FlashKind) {
         let expires = std::time::Instant::now() + std::time::Duration::from_secs(3);
         self.flash_temp = Some((msg.into(), kind, expires));
@@ -294,6 +301,7 @@ impl App {
         if let Some((k, m)) = self.version.take_flash() {
             match k {
                 FlashKind::Info => self.set_flash(m),
+                FlashKind::Warning => self.set_flash_warning(m),
                 FlashKind::Error => self.set_flash_error(m),
             }
             changed = true;
@@ -380,6 +388,7 @@ impl App {
         if let Some((s, kind)) = flash_info {
             let style = match kind {
                 FlashKind::Info => theme::accent(),
+                FlashKind::Warning => theme::warning(),
                 FlashKind::Error => theme::danger(),
             };
             f.render_widget(
@@ -524,6 +533,7 @@ impl App {
                 if let Some((k, m)) = self.comfy.take_flash() {
                     match k {
                         FlashKind::Info => self.set_flash(m),
+                        FlashKind::Warning => self.set_flash_warning(m),
                         FlashKind::Error => self.set_flash_error(m),
                     }
                 }
@@ -533,6 +543,7 @@ impl App {
                 if let Some((k, m)) = self.version.take_flash() {
                     match k {
                         FlashKind::Info => self.set_flash(m),
+                        FlashKind::Warning => self.set_flash_warning(m),
                         FlashKind::Error => self.set_flash_error(m),
                     }
                 }
@@ -542,6 +553,7 @@ impl App {
                 if let Some((k, m)) = self.launcher.take_flash() {
                     match k {
                         FlashKind::Info => self.set_flash(m),
+                        FlashKind::Warning => self.set_flash_warning(m),
                         FlashKind::Error => self.set_flash_error(m),
                     }
                 }
@@ -551,6 +563,7 @@ impl App {
                 if let Some((k, m)) = self.logs.take_flash() {
                     match k {
                         FlashKind::Info => self.set_flash(m),
+                        FlashKind::Warning => self.set_flash_warning(m),
                         FlashKind::Error => self.set_flash_error(m),
                     }
                 }
@@ -660,6 +673,7 @@ impl App {
                 if let Some((k, msg)) = self.comfy.take_flash() {
                     match k {
                         FlashKind::Info => self.set_flash(msg),
+                        FlashKind::Warning => self.set_flash_warning(msg),
                         FlashKind::Error => self.set_flash_error(msg),
                     }
                 }
@@ -669,6 +683,7 @@ impl App {
                 if let Some((k, msg)) = self.version.take_flash() {
                     match k {
                         FlashKind::Info => self.set_flash(msg),
+                        FlashKind::Warning => self.set_flash_warning(msg),
                         FlashKind::Error => self.set_flash_error(msg),
                     }
                 }
@@ -678,6 +693,7 @@ impl App {
                 if let Some((k, msg)) = self.launcher.take_flash() {
                     match k {
                         FlashKind::Info => self.set_flash(msg),
+                        FlashKind::Warning => self.set_flash_warning(msg),
                         FlashKind::Error => self.set_flash_error(msg),
                     }
                 }
@@ -687,6 +703,7 @@ impl App {
                 if let Some((k, msg)) = self.logs.take_flash() {
                     match k {
                         FlashKind::Info => self.set_flash(msg),
+                        FlashKind::Warning => self.set_flash_warning(msg),
                         FlashKind::Error => self.set_flash_error(msg),
                     }
                 }
@@ -841,6 +858,9 @@ impl App {
             }
             A::Flash(FlashKind::Info, msg) => {
                 self.set_flash(msg);
+            }
+            A::Flash(FlashKind::Warning, msg) => {
+                self.set_flash_warning(msg);
             }
             A::Flash(FlashKind::Error, msg) => {
                 self.set_flash_error(msg);

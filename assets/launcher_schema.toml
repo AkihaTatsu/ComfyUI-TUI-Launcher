@@ -41,6 +41,14 @@ cli = ""
 default = "en-US"
 
 [[tab.field]]
+key = "general.git_concurrency"
+name = "setting_git_concurrency"
+desc = "setting_git_concurrency_desc"
+type = "custom"
+cli = ""
+default = "1"
+
+[[tab.field]]
 key = "network.pypi_mirror"
 name = "setting_pypi_mirror"
 desc = "setting_pypi_mirror_desc"

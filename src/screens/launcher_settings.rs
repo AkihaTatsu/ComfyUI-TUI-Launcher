@@ -72,6 +72,7 @@ fn get(cfg: &Config, key: &str) -> Value {
         "general.language" => Value::String(cfg.general.language.clone()),
         "general.comfyui_dir" => Value::String(cfg.general.comfyui_dir.clone()),
         "general.python" => Value::String(cfg.general.python.clone()),
+        "general.git_concurrency" => Value::String(cfg.general.git_concurrency.to_string()),
         "network.pypi_mirror" => Value::String(cfg.network.pypi_mirror.clone()),
         "network.git_mirror" => Value::String(cfg.network.git_mirror.clone()),
         "network.hf_mirror" => Value::String(cfg.network.hf_mirror.clone()),
@@ -127,6 +128,13 @@ fn set(cfg: &mut Config, key: &str, v: Value) -> Result<(), String> {
                 return Err(i18n::t("popup_invalid_py"));
             }
             cfg.general.python = resolved.display().to_string();
+            let _ = cfg.save();
+            Ok(())
+        }
+        "general.git_concurrency" => {
+            let parsed =
+                parse_count(&v, 1)?.min(crate::core::config::MAX_GIT_CONCURRENCY as u64) as usize;
+            cfg.general.git_concurrency = crate::core::config::normalize_git_concurrency(parsed);
             let _ = cfg.save();
             Ok(())
         }

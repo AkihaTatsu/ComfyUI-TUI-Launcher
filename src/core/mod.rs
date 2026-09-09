@@ -33,6 +33,8 @@ pub mod process;
 pub mod python;
 /// Schema definitions for ComfyUI and launcher settings.
 pub mod schema;
+/// Cross-platform storage-capacity inspection used before write-heavy tasks.
+pub mod storage;
 /// Width-aware text utilities for terminal layout.
 pub mod text;
 /// Color palette and styling helpers.

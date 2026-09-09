@@ -3,7 +3,7 @@
 //! Lists release tags or commits and provides actions to change version,
 //! pull, and reinstall requirements.
 
-use super::{TaskKind, TaskRequest, TaskResult, LIST_MAX_NUM};
+use super::{RepositoryAccess, TaskKind, TaskRequest, TaskResult, LIST_MAX_NUM};
 use crate::core::config::Config;
 use crate::core::{env, git, i18n, pip, theme};
 use crate::widgets::focus_grid::{FocusGrid, RowKind};
@@ -699,14 +699,14 @@ pub fn load_request_with_env(
         then: TaskKind::None,
         is_refresh: true,
         changes_repository: false,
+        repository_access: RepositoryAccess::Exclusive,
         work: Box::new(move |tx| {
+            super::warn_if_storage_low(&tx, &root);
             // Fetch first so HEAD/remote refs are current, then deepen if the
             // repo is a shallow clone — otherwise `git log` would silently
-            // stop at the shallow boundary and the user could never page past
-            // it. Both calls are best-effort and ignore errors.
-            let _ = git::fetch(&root, env_vars.clone());
-            // Deepen until the repo is fully unshallowed (or we've truly tried).
-            let _ = git::deepen_until_full(&root, env_vars);
+            // stop at the shallow boundary and the user could never page past it.
+            let fetch_result = git::fetch_with_recovery(&root, env_vars.clone());
+            let deepen_ok = fetch_result.is_ok() && git::deepen_until_full(&root, env_vars);
             let current = git::current_commit(&root);
             let branch = git::current_branch(&root);
             let remote = git::remote_url(&root);
@@ -723,7 +723,21 @@ pub fn load_request_with_env(
                 root,
                 requested_limit: limit,
             });
-            super::TaskOutcome::Success
+            match fetch_result {
+                Err(error) => super::TaskOutcome::PartialFailure(vec![super::ItemFailure::new(
+                    "ComfyUI",
+                    "git fetch",
+                    error.to_string(),
+                )]),
+                Ok(()) if !deepen_ok => {
+                    super::TaskOutcome::PartialFailure(vec![super::ItemFailure::new(
+                        "ComfyUI",
+                        "git fetch",
+                        "repository history could not be fully fetched; see the task log",
+                    )])
+                }
+                Ok(()) => super::TaskOutcome::Success,
+            }
         }),
     }
 }
@@ -746,6 +760,7 @@ pub fn local_load_request(
         then,
         is_refresh: true,
         changes_repository: false,
+        repository_access: RepositoryAccess::None,
         work: Box::new(move |tx| {
             let scan = scan_local(&root, limit);
             let _ = tx.send(TaskResult::CoreData {
@@ -778,39 +793,14 @@ fn pull_request(
         then,
         is_refresh: false,
         changes_repository: true,
+        repository_access: RepositoryAccess::Exclusive,
         work: Box::new(move |tx| {
+            super::warn_if_storage_low(&tx, &root);
             // Same fetch+reset strategy as extensions: works for detached
             // HEAD (from prior Change Version) and discards local edits to
             // tracked files (untracked files are kept).
-            let fetched = git::fetch(&root, env_vars.clone()).unwrap_or(false);
-            if !fetched {
-                return super::TaskOutcome::failure(
-                    "ComfyUI",
-                    "git fetch",
-                    "command failed; see the task log",
-                );
-            }
-            // Prefer the configured upstream on a branch, but retain remote
-            // fallbacks for repositories whose local branch has no upstream.
-            // Detached HEAD starts directly with those fallbacks.
-            let targets: &[&str] = if git::current_branch(&root).is_some() {
-                &["@{u}", "origin/HEAD", "FETCH_HEAD"]
-            } else {
-                &["origin/HEAD", "FETCH_HEAD"]
-            };
-            let mut reset_ok = false;
-            for t in targets {
-                if git::reset_hard(&root, t, env_vars.clone()).unwrap_or(false) {
-                    reset_ok = true;
-                    break;
-                }
-            }
-            if !reset_ok {
-                return super::TaskOutcome::failure(
-                    "ComfyUI",
-                    "git reset",
-                    "no upstream target could be checked out; see the task log",
-                );
+            if let Err(error) = git::sync_to_upstream(&root, env_vars.clone()) {
+                return super::TaskOutcome::failure("ComfyUI", "git sync", error.to_string());
             }
 
             let _ = tx.send(TaskResult::CoreHeadUpdate {
@@ -849,7 +839,9 @@ fn checkout_request(
         then: TaskKind::None,
         is_refresh: false,
         changes_repository: true,
+        repository_access: RepositoryAccess::Exclusive,
         work: Box::new(move |tx| {
+            super::warn_if_storage_low(&tx, &root);
             let checkout_ok = git::checkout(&root, &rev, env_vars.clone()).unwrap_or(false);
             if !checkout_ok {
                 return super::TaskOutcome::failure(

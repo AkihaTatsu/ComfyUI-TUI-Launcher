@@ -67,6 +67,12 @@ pub fn danger() -> Style {
         .fg(DARK.danger)
         .add_modifier(Modifier::BOLD)
 }
+/// Returns the warning style used for non-fatal conditions.
+pub fn warning() -> Style {
+    Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD)
+}
 /// Returns the border style.
 pub fn border() -> Style {
     Style::default().fg(DARK.border)

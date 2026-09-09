@@ -12,6 +12,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use toml::Value;
 
+/// Upper bound for user-configured Git workers inside one batch task.
+pub const MAX_GIT_CONCURRENCY: usize = 32;
+
 // Defaults for `launcher_config.toml` mirror the entries in
 // `launcher_schema.toml`. On first run the file is instantiated via serde's
 // `Default` impls so the two stay in sync.
@@ -31,6 +34,10 @@ pub struct General {
     /// UI mode (`advanced` or `simple`).
     #[serde(default = "default_mode")]
     pub mode: String,
+    /// Maximum number of repositories processed concurrently by Git-heavy
+    /// extension scans and bulk operations.
+    #[serde(default = "default_git_concurrency")]
+    pub git_concurrency: usize,
     /// When enabled, the launcher stays alive as a supervisor and restarts
     /// ComfyUI after an unexpected crash. See [`crate::core::process`].
     #[serde(default)]
@@ -58,6 +65,15 @@ fn default_lang() -> String {
 fn default_mode() -> String {
     "advanced".into()
 }
+fn default_git_concurrency() -> usize {
+    1
+}
+
+/// Applies the supported range to persisted or programmatically supplied
+/// concurrency values.
+pub fn normalize_git_concurrency(value: usize) -> usize {
+    value.clamp(1, MAX_GIT_CONCURRENCY)
+}
 fn default_restart_delay() -> u64 {
     2
 }
@@ -78,6 +94,7 @@ impl Default for General {
             python: String::new(),
             language: default_lang(),
             mode: default_mode(),
+            git_concurrency: default_git_concurrency(),
             crash_auto_restart: false,
             crash_restart_delay_secs: default_restart_delay(),
             crash_restart_window_secs: default_restart_window(),
@@ -231,6 +248,7 @@ impl Config {
                 .or_else(|| available.first().cloned())
                 .unwrap_or_default();
         }
+        lfile.general.git_concurrency = normalize_git_concurrency(lfile.general.git_concurrency);
         // Persist the canonical form so the file matches the in-memory
         // value next time it is read. Best-effort.
         {
@@ -298,5 +316,24 @@ impl Config {
     /// Returns the current value for a ComfyUI setting, if one was stored.
     pub fn get_comfy<'a>(&'a self, key: &str) -> Option<&'a Value> {
         self.comfy_settings.get(key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_general_config_defaults_git_concurrency_to_one() {
+        let file: LauncherFile = toml::from_str("[general]\nmode = 'advanced'\n")
+            .expect("legacy launcher config should parse");
+        assert_eq!(file.general.git_concurrency, 1);
+    }
+
+    #[test]
+    fn git_concurrency_is_bounded() {
+        assert_eq!(normalize_git_concurrency(0), 1);
+        assert_eq!(normalize_git_concurrency(1), 1);
+        assert_eq!(normalize_git_concurrency(MAX_GIT_CONCURRENCY + 10), 32);
     }
 }
