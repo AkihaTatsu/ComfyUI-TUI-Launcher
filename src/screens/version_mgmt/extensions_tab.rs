@@ -210,7 +210,11 @@ impl ExtensionsTab {
     /// fire (the Button widget's own `pending` slot decides — gives one
     /// full frame of focus highlight before the request runs).
     /// Polled by `VersionMgmt::tick` to drain deferred button presses.
-    pub fn poll_button_action(&mut self, cfg: &Config) -> Option<TaskRequest> {
+    pub fn poll_button_action(&mut self, cfg: &Config, bulk_enabled: bool) -> Option<TaskRequest> {
+        if !bulk_enabled {
+            self.btn_update_all.cancel_pending();
+            self.btn_reinstall_all.cancel_pending();
+        }
         // Confirm popup (Uninstall y/n).
         if let Some(c) = &mut self.confirm {
             match c.tick() {
@@ -247,21 +251,14 @@ impl ExtensionsTab {
                 None => {}
             }
         }
-        if self.btn_update_all.poll_fire() {
-            let items = self.items.clone();
-            let env_vars = env::build(&cfg.network);
-            let python = cfg.general.python.clone();
-            let root = PathBuf::from(&cfg.general.comfyui_dir);
-            return Some(update_all_request(
-                items,
-                root,
-                env_vars,
-                python,
-                cfg.general.git_concurrency,
-            ));
+        if self.btn_update_all.poll_fire() && bulk_enabled {
+            return self.request_update_all(cfg);
         }
         if self.btn_reinstall_all.poll_fire() {
-            let items = self.items.clone();
+            if !bulk_enabled {
+                return None;
+            }
+            let items = bulk_candidates(&self.items, BulkMode::ReinstallAll);
             let env_vars = env::build(&cfg.network);
             let python = cfg.general.python.clone();
             let root = PathBuf::from(&cfg.general.comfyui_dir);
@@ -274,6 +271,22 @@ impl ExtensionsTab {
             ));
         }
         None
+    }
+
+    /// Uses the current list's update markers for both mouse and keyboard.
+    fn request_update_all(&mut self, cfg: &Config) -> Option<TaskRequest> {
+        let items = bulk_candidates(&self.items, BulkMode::UpdateOutdated);
+        if items.is_empty() {
+            self.pending_flash = Some((FlashKind::Info, i18n::t("task_ext_no_updates")));
+            return None;
+        }
+        Some(update_all_request(
+            items,
+            PathBuf::from(&cfg.general.comfyui_dir),
+            env::build(&cfg.network),
+            cfg.general.python.clone(),
+            cfg.general.git_concurrency,
+        ))
     }
 
     /// Map each visible row back to an index in `self.items` using a
@@ -309,7 +322,14 @@ impl ExtensionsTab {
     }
 
     /// Renders the tab into `area`.
-    pub fn render(&self, f: &mut Frame, area: Rect, _cfg: &Config, body_active: bool) {
+    pub fn render(
+        &self,
+        f: &mut Frame,
+        area: Rect,
+        _cfg: &Config,
+        body_active: bool,
+        bulk_enabled: bool,
+    ) {
         let v = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(3), Constraint::Min(0)])
@@ -339,17 +359,19 @@ impl ExtensionsTab {
             top[0],
             self.grid.row() == 0 && self.grid.col() == 0 && active,
         );
-        self.btn_update_all.render(
+        self.btn_update_all.render_enabled(
             f,
             top[1],
             &i18n::t("btn_update_all"),
             self.grid.row() == 0 && self.grid.col() == 1 && active,
+            bulk_enabled,
         );
-        self.btn_reinstall_all.render(
+        self.btn_reinstall_all.render_enabled(
             f,
             top[2],
             &i18n::t("btn_reinstall_all"),
             self.grid.row() == 0 && self.grid.col() == 2 && active,
+            bulk_enabled,
         );
 
         let table_area = v[1];
@@ -496,6 +518,7 @@ impl ExtensionsTab {
         m: crossterm::event::MouseEvent,
         area: Rect,
         cfg: &Config,
+        bulk_enabled: bool,
     ) -> Option<TaskRequest> {
         // 1. Actions menu hit-test (4 fixed rows in a 50x8 centered popup).
         if let Some(am_ref) = &self.actions_menu {
@@ -635,6 +658,9 @@ impl ExtensionsTab {
         };
 
         if inside(upd_btn_area) {
+            if !bulk_enabled {
+                return None;
+            }
             // Arm the Button's deferred-fire pipeline. The action request
             // is built by `poll_button_action` two frames later, after one
             // full frame of visible focus highlight.
@@ -643,6 +669,9 @@ impl ExtensionsTab {
             return None;
         }
         if inside(rei_btn_area) {
+            if !bulk_enabled {
+                return None;
+            }
             self.grid.set_focus(0, 2);
             self.btn_reinstall_all.click();
             return None;
@@ -680,7 +709,7 @@ impl ExtensionsTab {
     }
 
     /// Handles a wheel-scroll event.
-    pub fn scroll(&mut self, delta: i32) {
+    pub fn scroll(&mut self, delta: i32, bulk_enabled: bool) {
         let n = self.filtered_indices().len();
         if n == 0 {
             return;
@@ -688,11 +717,19 @@ impl ExtensionsTab {
         self.grid.set_list_len(n);
         self.grid.set_visible_rows(self.visible_rows.get().max(1));
         self.grid.scroll(delta);
+        self.skip_disabled_bulk_focus(bulk_enabled);
+    }
+
+    fn skip_disabled_bulk_focus(&mut self, bulk_enabled: bool) {
+        if !bulk_enabled && self.grid.row() == 0 && self.grid.col() != 0 {
+            self.grid.set_focus(0, 0);
+        }
     }
 
     /// Attempts to handle a Left arrow within this tab.
     /// Returns `true` if the key was consumed.
-    pub fn on_left(&mut self) -> bool {
+    pub fn on_left(&mut self, bulk_enabled: bool) -> bool {
+        self.skip_disabled_bulk_focus(bulk_enabled);
         if self.grid.row() == 0 && self.grid.col() == 0 && !self.search.at_start() {
             self.search.on_key(KeyCode::Left);
             return true;
@@ -702,16 +739,27 @@ impl ExtensionsTab {
 
     /// Attempts to handle a Right arrow within this tab.
     /// Returns `true` if the key was consumed.
-    pub fn on_right(&mut self) -> bool {
+    pub fn on_right(&mut self, bulk_enabled: bool) -> bool {
+        self.skip_disabled_bulk_focus(bulk_enabled);
         if self.grid.row() == 0 && self.grid.col() == 0 && !self.search.at_end() {
             self.search.on_key(KeyCode::Right);
             return true;
         }
-        self.grid.move_right()
+        if bulk_enabled {
+            self.grid.move_right()
+        } else {
+            false
+        }
     }
 
     /// Handles a key event.
-    pub fn on_key(&mut self, code: KeyCode, cfg: &Config) -> Option<TaskRequest> {
+    pub fn on_key(
+        &mut self,
+        code: KeyCode,
+        cfg: &Config,
+        bulk_enabled: bool,
+    ) -> Option<TaskRequest> {
+        self.skip_disabled_bulk_focus(bulk_enabled);
         let root = PathBuf::from(&cfg.general.comfyui_dir);
 
         // Notice popup — Tab/L/R toggles button focus, Enter activates,
@@ -870,6 +918,7 @@ impl ExtensionsTab {
         match code {
             KeyCode::PageUp => {
                 self.grid.page_up();
+                self.skip_disabled_bulk_focus(bulk_enabled);
                 return None;
             }
             KeyCode::PageDown => {
@@ -884,7 +933,11 @@ impl ExtensionsTab {
         if self.grid.row() == 0 && self.grid.col() == 0 {
             match code {
                 KeyCode::Tab => {
-                    self.grid.set_focus(0, 1);
+                    if bulk_enabled {
+                        self.grid.set_focus(0, 1);
+                    } else {
+                        self.grid.set_focus(1, 0);
+                    }
                 }
                 KeyCode::BackTab => {
                     self.grid.set_focus(1, 0);
@@ -933,16 +986,7 @@ impl ExtensionsTab {
                     return None;
                 }
                 KeyCode::Enter => {
-                    let items = self.items.clone();
-                    let env_vars = env::build(&cfg.network);
-                    let python = cfg.general.python.clone();
-                    return Some(update_all_request(
-                        items,
-                        root,
-                        env_vars,
-                        python,
-                        cfg.general.git_concurrency,
-                    ));
+                    return self.request_update_all(cfg);
                 }
                 _ => return None,
             }
@@ -972,7 +1016,7 @@ impl ExtensionsTab {
                     return None;
                 }
                 KeyCode::Enter => {
-                    let items = self.items.clone();
+                    let items = bulk_candidates(&self.items, BulkMode::ReinstallAll);
                     let env_vars = env::build(&cfg.network);
                     let python = cfg.general.python.clone();
                     return Some(reinstall_all_request(
@@ -989,10 +1033,11 @@ impl ExtensionsTab {
 
         if matches!(code, KeyCode::Tab) {
             self.grid.page_up();
+            self.skip_disabled_bulk_focus(bulk_enabled);
             return None;
         }
         if matches!(code, KeyCode::BackTab) {
-            self.grid.set_focus(0, 2);
+            self.grid.set_focus(0, if bulk_enabled { 2 } else { 0 });
             return None;
         }
 
@@ -1002,6 +1047,7 @@ impl ExtensionsTab {
                     return None;
                 }
                 self.grid.move_up();
+                self.skip_disabled_bulk_focus(bulk_enabled);
                 None
             }
             KeyCode::Down => {
@@ -1019,9 +1065,11 @@ impl ExtensionsTab {
                         ));
                     }
                     self.grid.move_down();
+                    self.skip_disabled_bulk_focus(bulk_enabled);
                     return None;
                 }
                 self.grid.move_down();
+                self.skip_disabled_bulk_focus(bulk_enabled);
                 None
             }
             KeyCode::Char('r') | KeyCode::Char('R') => {
@@ -1244,9 +1292,8 @@ pub fn scan_local(root: &Path, limit: usize) -> Vec<Extension> {
 ///
 /// Runs `git fetch` per extension and recomputes `behind_upstream`,
 /// emitting per-item Progress for the flash banner. The final `ExtData`
-/// replaces the synchronously populated list. Display is not gated on
-/// this task because `scan_local` already populated the list at tab
-/// entry.
+/// replaces the local snapshot. The table can display that snapshot
+/// while bulk actions wait for this remote check to finish.
 pub fn load_request_with_limit(
     root: PathBuf,
     limit: usize,
@@ -1259,6 +1306,7 @@ pub fn load_request_with_limit(
         is_refresh: true,
         changes_repository: false,
         repository_access: RepositoryAccess::Exclusive,
+        ext_scan_root: Some(root.clone()),
         work: Box::new(move |tx| {
             use std::sync::{
                 atomic::{AtomicUsize, Ordering},
@@ -1303,6 +1351,7 @@ pub fn load_request_with_limit(
                     items: Vec::new(),
                     root,
                     requested_limit: limit,
+                    remote_checked: true,
                 });
                 return super::TaskOutcome::Success;
             }
@@ -1397,6 +1446,7 @@ pub fn load_request_with_limit(
                 items: out,
                 root,
                 requested_limit: limit,
+                remote_checked: true,
             });
             if failures.is_empty() {
                 super::TaskOutcome::Success
@@ -1427,12 +1477,14 @@ pub fn local_load_request(
         is_refresh: true,
         changes_repository: false,
         repository_access: RepositoryAccess::None,
+        ext_scan_root: Some(root.clone()),
         work: Box::new(move |tx| {
             let items = scan_local(&root, limit);
             let _ = tx.send(TaskResult::ExtData {
                 items,
                 root,
                 requested_limit: limit,
+                remote_checked: false,
             });
             super::TaskOutcome::Success
         }),
@@ -1448,7 +1500,7 @@ fn worker_count(configured: usize, total: usize) -> usize {
 pub(super) fn update_one_request(
     path: PathBuf,
     name: String,
-    _root: PathBuf,
+    root: PathBuf,
     env_vars: std::collections::HashMap<String, String>,
     python: String,
 ) -> TaskRequest {
@@ -1459,23 +1511,21 @@ pub(super) fn update_one_request(
         is_refresh: false,
         changes_repository: true,
         repository_access: RepositoryAccess::Exclusive,
+        ext_scan_root: None,
         work: Box::new(move |tx| {
             super::warn_if_storage_low(&tx, &path);
             if let Err(e) = git::sync_to_upstream(&path, env_vars.clone()) {
                 return super::TaskOutcome::failure(name, "git sync", e.to_string());
             }
             let mut failures = Vec::new();
-            if !python.is_empty() {
-                let pip_ok =
-                    pip::install_requirements(std::path::Path::new(&python), &path, env_vars)
-                        .unwrap_or(false);
-                if !pip_ok {
-                    failures.push(super::ItemFailure::new(
-                        &name,
-                        "pip install",
-                        "source changed, but dependency installation failed; see the task log",
-                    ));
-                }
+            if let Err(error) =
+                pip::install_custom_node(std::path::Path::new(&python), &root, &path, env_vars)
+            {
+                failures.push(super::ItemFailure::new(
+                    &name,
+                    error.stage.label(),
+                    error.detail("source changed, but post-install processing failed"),
+                ));
             }
             if let Some(ext) = read_one_local(&path) {
                 let _ = tx.send(TaskResult::ExtRowUpdate {
@@ -1497,6 +1547,20 @@ pub(super) fn update_one_request(
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BulkMode {
+    UpdateOutdated,
+    ReinstallAll,
+}
+
+fn bulk_candidates(items: &[Extension], mode: BulkMode) -> Vec<Extension> {
+    items
+        .iter()
+        .filter(|ext| ext.managed && (mode == BulkMode::ReinstallAll || ext.behind > 0))
+        .cloned()
+        .collect()
+}
+
 fn update_all_request(
     items: Vec<Extension>,
     root: PathBuf,
@@ -1506,6 +1570,7 @@ fn update_all_request(
 ) -> TaskRequest {
     bulk_sync_request(
         i18n::t("task_ext_update_all"),
+        BulkMode::UpdateOutdated,
         items,
         root,
         env_vars,
@@ -1519,17 +1584,21 @@ fn update_all_request(
 /// same Python environment.
 fn bulk_sync_request(
     title: String,
+    mode: BulkMode,
     items: Vec<Extension>,
     root: PathBuf,
     env_vars: std::collections::HashMap<String, String>,
     python: String,
     git_concurrency: usize,
 ) -> TaskRequest {
-    let then = TaskKind::ExtLoad {
-        root: root.clone(),
-        env: env_vars.clone(),
-        limit: super::LIST_MAX_NUM,
-        git_concurrency,
+    let then = match mode {
+        BulkMode::UpdateOutdated => TaskKind::None,
+        BulkMode::ReinstallAll => TaskKind::ExtLoad {
+            root: root.clone(),
+            env: env_vars.clone(),
+            limit: super::LIST_MAX_NUM,
+            git_concurrency,
+        },
     };
     TaskRequest {
         title,
@@ -1537,10 +1606,13 @@ fn bulk_sync_request(
         is_refresh: false,
         changes_repository: true,
         repository_access: RepositoryAccess::Exclusive,
+        ext_scan_root: None,
         work: Box::new(move |tx| {
             super::warn_if_storage_low(&tx, &root);
-            let managed: Vec<Extension> = items.into_iter().filter(|e| e.managed).collect();
-            let total = managed.len();
+            // Selection is frozen before this task starts. Git and post-install
+            // both consume this same list, with post-install limited to syncs
+            // that succeeded.
+            let total = items.len();
             let _ = tx.send(TaskResult::Progress { done: 0, total });
             if total == 0 {
                 return super::TaskOutcome::Success;
@@ -1550,7 +1622,7 @@ fn bulk_sync_request(
             let chunk = total.div_ceil(workers);
             let (result_tx, result_rx) = std::sync::mpsc::channel();
             let mut handles = Vec::with_capacity(workers);
-            for entries in managed.chunks(chunk) {
+            for entries in items.chunks(chunk) {
                 let entries = entries.to_vec();
                 let env = env_vars.clone();
                 let result_tx = result_tx.clone();
@@ -1591,18 +1663,29 @@ fn bulk_sync_request(
             // Intentionally sequential: concurrent pip processes are unsafe
             // against one shared site-packages directory on every platform.
             for (index, ext) in synced.into_iter().enumerate() {
-                if !python.is_empty() {
-                    let pip_ok = pip::install_requirements(
-                        std::path::Path::new(&python),
-                        &ext.path,
-                        env_vars.clone(),
-                    )
-                    .unwrap_or(false);
-                    if !pip_ok {
+                if let Err(error) = pip::install_custom_node(
+                    std::path::Path::new(&python),
+                    &root,
+                    &ext.path,
+                    env_vars.clone(),
+                ) {
+                    failures.push(super::ItemFailure::new(
+                        &ext.name,
+                        error.stage.label(),
+                        error.detail("source changed, but post-install processing failed"),
+                    ));
+                }
+                if mode == BulkMode::UpdateOutdated {
+                    if let Some(updated) = read_one_local(&ext.path) {
+                        let _ = tx.send(TaskResult::ExtRowUpdate {
+                            old_path: ext.path.clone(),
+                            ext: updated,
+                        });
+                    } else {
                         failures.push(super::ItemFailure::new(
-                            ext.name,
-                            "pip install",
-                            "source changed, but dependency installation failed; see the task log",
+                            &ext.name,
+                            "read state",
+                            "repository changed, but its new state could not be read",
                         ));
                     }
                 }
@@ -1610,13 +1693,18 @@ fn bulk_sync_request(
                 let _ = tx.send(TaskResult::Progress { done, total });
             }
 
-            // Publish actual local state before the follow-up remote refresh.
-            let refreshed = scan_local(&root, super::LIST_MAX_NUM);
-            let _ = tx.send(TaskResult::ExtData {
-                items: refreshed,
-                root,
-                requested_limit: super::LIST_MAX_NUM,
-            });
+            if mode == BulkMode::ReinstallAll {
+                // Reinstall All can change every row and keeps its full
+                // follow-up scan. Update All has already refreshed only the
+                // selected rows above.
+                let refreshed = scan_local(&root, super::LIST_MAX_NUM);
+                let _ = tx.send(TaskResult::ExtData {
+                    items: refreshed,
+                    root,
+                    requested_limit: super::LIST_MAX_NUM,
+                    remote_checked: false,
+                });
+            }
 
             if failures.is_empty() {
                 super::TaskOutcome::Success
@@ -1644,6 +1732,7 @@ fn list_versions_request_n(
         is_refresh: false,
         changes_repository: false,
         repository_access: RepositoryAccess::Exclusive,
+        ext_scan_root: None,
         work: Box::new(move |tx| {
             super::warn_if_storage_low(&tx, &path);
             let fetch_result = git::fetch_with_recovery(&path, env_vars.clone());
@@ -1679,7 +1768,7 @@ fn checkout_ext_request(
     path: PathBuf,
     name: String,
     rev: String,
-    _root: PathBuf,
+    root: PathBuf,
     env_vars: std::collections::HashMap<String, String>,
     python: String,
 ) -> TaskRequest {
@@ -1690,6 +1779,7 @@ fn checkout_ext_request(
         is_refresh: false,
         changes_repository: true,
         repository_access: RepositoryAccess::Exclusive,
+        ext_scan_root: None,
         work: Box::new(move |tx| {
             super::warn_if_storage_low(&tx, &path);
             if !git::checkout(&path, &rev, env_vars.clone()).unwrap_or(false) {
@@ -1716,14 +1806,13 @@ fn checkout_ext_request(
                 )),
                 _ => {}
             }
-            if !python.is_empty()
-                && !pip::install_requirements(std::path::Path::new(&python), &path, env_vars)
-                    .unwrap_or(false)
+            if let Err(error) =
+                pip::install_custom_node(std::path::Path::new(&python), &root, &path, env_vars)
             {
                 failures.push(super::ItemFailure::new(
                     &name,
-                    "pip install",
-                    "source changed, but dependency installation failed; see the task log",
+                    error.stage.label(),
+                    error.detail("source changed, but post-install processing failed"),
                 ));
             }
             if let Some(ext) = read_one_local(&path) {
@@ -1755,6 +1844,7 @@ fn uninstall_request(path: PathBuf, _root: PathBuf, name: String) -> TaskRequest
         is_refresh: false,
         changes_repository: true,
         repository_access: RepositoryAccess::Exclusive,
+        ext_scan_root: None,
         work: Box::new(move |tx| {
             super::warn_if_storage_low(&tx, &path);
             if let Err(e) = std::fs::remove_dir_all(&path) {
@@ -1785,6 +1875,7 @@ fn toggle_enabled_request(
         is_refresh: false,
         changes_repository: true,
         repository_access: RepositoryAccess::Exclusive,
+        ext_scan_root: None,
         work: Box::new(move |tx| {
             super::warn_if_storage_low(&tx, &path);
             let new_path = if currently_disabled {
@@ -1839,6 +1930,7 @@ fn reinstall_all_request(
 ) -> TaskRequest {
     bulk_sync_request(
         i18n::t("task_ext_reinstall_all"),
+        BulkMode::ReinstallAll,
         items,
         root,
         env_vars,
@@ -1866,15 +1958,132 @@ mod tests {
     }
 
     #[test]
+    fn update_all_selects_only_managed_nodes_behind_upstream() {
+        let mut latest = extension("latest");
+        latest.managed = true;
+        let mut outdated = extension("outdated");
+        outdated.managed = true;
+        outdated.behind = 2;
+        let mut disabled = extension("disabled");
+        disabled.managed = true;
+        disabled.disabled = true;
+        disabled.behind = 1;
+        let mut unmanaged = extension("unmanaged");
+        unmanaged.behind = 3;
+
+        let items = [latest, outdated, disabled, unmanaged];
+        let candidates = bulk_candidates(&items, BulkMode::UpdateOutdated);
+        let names: Vec<&str> = candidates.iter().map(|ext| ext.name.as_str()).collect();
+        assert_eq!(names, ["outdated", "disabled"]);
+        let all = bulk_candidates(&items, BulkMode::ReinstallAll);
+        let all_names: Vec<&str> = all.iter().map(|ext| ext.name.as_str()).collect();
+        assert_eq!(all_names, ["latest", "outdated", "disabled"]);
+    }
+
+    #[test]
+    fn update_all_uses_only_selected_nodes_without_a_full_rescan() {
+        let mut items: Vec<Extension> = (0..101)
+            .map(|index| {
+                let mut ext = extension(&format!("node-{index}"));
+                ext.managed = true;
+                ext
+            })
+            .collect();
+        items[7].behind = 1;
+        items[79].behind = 3;
+
+        let selected = bulk_candidates(&items, BulkMode::UpdateOutdated);
+        assert_eq!(selected.len(), 2);
+        let request = update_all_request(
+            selected,
+            PathBuf::new(),
+            Default::default(),
+            String::new(),
+            4,
+        );
+        assert!(matches!(request.then, TaskKind::None));
+    }
+
+    #[test]
+    fn update_all_with_no_candidates_only_shows_a_message() {
+        let mut tab = ExtensionsTab::new();
+        let mut latest = extension("latest");
+        latest.managed = true;
+        tab.items.push(latest);
+        tab.grid.set_focus(0, 1);
+        let cfg = Config::default();
+
+        assert!(tab.on_key(KeyCode::Enter, &cfg, true).is_none());
+        assert!(matches!(tab.take_flash(), Some((FlashKind::Info, _))));
+        tab.btn_update_all.click();
+        assert!(tab.poll_button_action(&cfg, true).is_none());
+        assert!(tab.poll_button_action(&cfg, true).is_none());
+        assert!(matches!(tab.take_flash(), Some((FlashKind::Info, _))));
+    }
+
+    #[test]
+    fn update_all_ignores_search_for_keyboard_and_mouse() {
+        let mut tab = ExtensionsTab::new();
+        let mut outdated = extension("outdated");
+        outdated.managed = true;
+        outdated.behind = 1;
+        tab.items.push(outdated);
+        tab.search.value = "no matching nodes".into();
+        tab.grid.set_focus(0, 1);
+        let cfg = Config::default();
+
+        assert!(tab.on_key(KeyCode::Enter, &cfg, true).is_some());
+        tab.btn_update_all.click();
+        assert!(tab.poll_button_action(&cfg, true).is_none());
+        assert!(tab.poll_button_action(&cfg, true).is_some());
+    }
+
+    #[test]
+    fn bulk_buttons_ignore_keyboard_mouse_and_queued_clicks_during_scan() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let mut tab = ExtensionsTab::new();
+        let cfg = Config::default();
+        tab.grid.set_focus(0, 1);
+        assert!(tab.on_key(KeyCode::Enter, &cfg, false).is_none());
+        assert_ne!((tab.grid.row(), tab.grid.col()), (0, 1));
+        tab.grid.set_focus(0, 2);
+        assert!(tab.on_key(KeyCode::Enter, &cfg, false).is_none());
+        assert_ne!((tab.grid.row(), tab.grid.col()), (0, 2));
+
+        let area = Rect::new(0, 0, 120, 20);
+        for column in [
+            area.width - update_all_button_width() - reinstall_all_button_width() + 1,
+            area.width - reinstall_all_button_width() + 1,
+        ] {
+            let click = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            };
+            assert!(tab.on_mouse(click, area, &cfg, false).is_none());
+        }
+        assert!(tab.poll_button_action(&cfg, true).is_none());
+        assert!(tab.poll_button_action(&cfg, true).is_none());
+
+        tab.btn_update_all.click();
+        tab.btn_reinstall_all.click();
+        assert!(tab.poll_button_action(&cfg, false).is_none());
+        assert!(tab.poll_button_action(&cfg, true).is_none());
+        assert!(tab.poll_button_action(&cfg, true).is_none());
+    }
+
+    #[test]
     fn page_down_works_after_page_up_focuses_search() {
         let mut tab = ExtensionsTab::new();
         tab.items = vec![extension("one"), extension("two"), extension("three")];
         tab.visible_rows.set(2);
 
-        tab.on_key(KeyCode::PageUp, &Config::default());
+        tab.on_key(KeyCode::PageUp, &Config::default(), true);
         assert_eq!((tab.grid.row(), tab.grid.col()), (0, 0));
 
-        tab.on_key(KeyCode::PageDown, &Config::default());
+        tab.on_key(KeyCode::PageDown, &Config::default(), true);
         assert_eq!((tab.grid.row(), tab.grid.list_selected()), (1, 2));
     }
 

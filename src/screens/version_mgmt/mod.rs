@@ -55,6 +55,8 @@ pub struct TaskRequest {
     /// Whether this task performs Git or repository-tree writes that must not
     /// overlap another top-level repository task.
     pub repository_access: RepositoryAccess,
+    /// ComfyUI root when this request is part of an extension scan.
+    pub ext_scan_root: Option<PathBuf>,
 }
 
 /// Scheduling class for operations that touch repositories on disk.
@@ -92,6 +94,36 @@ pub enum TaskKind {
 /// edge.
 pub const LIST_MAX_NUM: usize = 1000;
 
+#[derive(Clone, Copy)]
+enum TaskTitleDetail {
+    None,
+    WaitingForRepository,
+    Progress { done: usize, total: usize },
+}
+
+fn format_task_title(title: &str, detail: TaskTitleDetail) -> String {
+    let detail = match detail {
+        TaskTitleDetail::None => String::new(),
+        TaskTitleDetail::WaitingForRepository => i18n::t("task_waiting_repository"),
+        TaskTitleDetail::Progress { done, total } => i18n::t_args(
+            "task_progress",
+            &[("done", &done.to_string()), ("total", &total.to_string())],
+        ),
+    };
+    i18n::t_args(
+        "task_title_with_detail",
+        &[("detail", &detail), ("title", title)],
+    )
+}
+
+fn format_working_title(title: &str, detail: TaskTitleDetail) -> String {
+    let task = format_task_title(title, detail);
+    i18n::t_args(
+        "popup_working_title",
+        &[("status", &i18n::t("popup_working")), ("title", &task)],
+    )
+}
+
 /// Result emitted by a background task.
 pub enum TaskResult {
     /// Result of a Core repository load.
@@ -121,6 +153,8 @@ pub enum TaskResult {
         root: PathBuf,
         /// Row count requested by the caller.
         requested_limit: usize,
+        /// True only for the completed remote-check pass, not a local snapshot.
+        remote_checked: bool,
     },
     /// Commit list for a single extension, used by the version picker popup.
     ExtCommits {
@@ -283,6 +317,7 @@ struct PendingTask {
     progress: Option<(usize, usize)>,
     changes_repository: bool,
     repository_access: RepositoryAccess,
+    ext_scan_root: Option<PathBuf>,
     warnings: Vec<String>,
 }
 
@@ -321,6 +356,8 @@ pub struct VersionMgmt {
     repo_changed: bool,
     core_requested_for: Option<PathBuf>,
     ext_requested_for: Option<PathBuf>,
+    /// Root whose last remote extension scan produced a complete list.
+    ext_scan_ready_for: Option<PathBuf>,
     registry_requested: bool,
 }
 
@@ -343,6 +380,7 @@ impl VersionMgmt {
             repo_changed: false,
             core_requested_for: None,
             ext_requested_for: None,
+            ext_scan_ready_for: None,
             registry_requested: false,
         }
     }
@@ -353,6 +391,24 @@ impl VersionMgmt {
     /// block input.
     pub fn is_busy(&self) -> bool {
         self.pending.is_some() || self.queued_mutation.is_some()
+    }
+
+    fn bulk_actions_enabled(&self, cfg: &Config) -> bool {
+        let root = Path::new(&cfg.general.comfyui_dir);
+        !root.as_os_str().is_empty()
+            && self.ext_scan_ready_for.as_deref() == Some(root)
+            && !self
+                .refresh
+                .as_ref()
+                .is_some_and(|task| task.ext_scan_root.is_some())
+            && !self
+                .pending
+                .as_ref()
+                .is_some_and(|task| task.ext_scan_root.is_some())
+            && !self
+                .queued_refresh
+                .iter()
+                .any(|task| task.ext_scan_root.is_some())
     }
 
     /// Drains transient flash messages from the Extensions and Install
@@ -375,8 +431,10 @@ impl VersionMgmt {
     pub fn permanent_flash(&self) -> Option<(crate::app::FlashKind, String)> {
         let p = self.refresh.as_ref()?;
         let text = match p.progress {
-            Some((d, t)) => format!("{} ({d}/{t})", p.title),
-            None => p.title.clone(),
+            Some((done, total)) => {
+                format_task_title(&p.title, TaskTitleDetail::Progress { done, total })
+            }
+            None => format_task_title(&p.title, TaskTitleDetail::None),
         };
         Some((crate::app::FlashKind::Info, text))
     }
@@ -396,9 +454,10 @@ impl VersionMgmt {
         }
         // Poll each sub-tab's persistent button widgets so the deferred
         // click-then-fire pipeline drains.
+        let bulk_enabled = self.bulk_actions_enabled(cfg);
         let req = self
             .ext
-            .poll_button_action(cfg)
+            .poll_button_action(cfg, bulk_enabled)
             .or_else(|| self.install.poll_button_action(cfg));
         if let Some(req) = req {
             self.spawn(req);
@@ -504,7 +563,8 @@ impl VersionMgmt {
         }
         let mut changed = false;
         let mut to_apply: Vec<TaskResult> = Vec::new();
-        let mut finished: Option<(TaskKind, TaskOutcome, bool, Vec<String>)> = None;
+        let mut finished: Option<(TaskKind, TaskOutcome, bool, Vec<String>, Option<PathBuf>)> =
+            None;
         let mut new_warnings = Vec::new();
         if let Some(p) = slot {
             loop {
@@ -519,6 +579,7 @@ impl VersionMgmt {
                             outcome,
                             p.changes_repository,
                             p.warnings.clone(),
+                            p.ext_scan_root.clone(),
                         ));
                         break;
                     }
@@ -539,6 +600,7 @@ impl VersionMgmt {
                             ),
                             p.changes_repository,
                             p.warnings.clone(),
+                            p.ext_scan_root.clone(),
                         ));
                         break;
                     }
@@ -552,13 +614,16 @@ impl VersionMgmt {
         if let Some(message) = new_warnings.last() {
             self.task_flash = Some((crate::app::FlashKind::Warning, message.clone()));
         }
-        if let Some((then, outcome, changes_repository, warnings)) = finished {
+        if let Some((then, outcome, changes_repository, warnings, ext_scan_root)) = finished {
             if for_refresh {
                 self.refresh = None;
             } else {
                 self.pending = None;
             }
             let run_follow_up = outcome_allows_follow_up(&outcome);
+            if ext_scan_root.is_some() && matches!(&outcome, TaskOutcome::Failure(_)) {
+                self.ext_scan_ready_for = None;
+            }
             self.handle_outcome(for_refresh, changes_repository, outcome, warnings);
             if run_follow_up {
                 self.queue_kind(then);
@@ -676,7 +741,11 @@ impl VersionMgmt {
                 items,
                 root,
                 requested_limit,
+                remote_checked,
             } => {
+                if remote_checked {
+                    self.ext_scan_ready_for = Some(root.clone());
+                }
                 self.ext.end_reached = items.len() < requested_limit;
                 self.ext.limit = requested_limit;
                 self.ext.items = items;
@@ -869,6 +938,9 @@ impl VersionMgmt {
                 || (self.queued_mutation.is_some()
                     && req.repository_access == RepositoryAccess::Exclusive)
             {
+                if req.ext_scan_root.is_some() {
+                    self.ext_scan_ready_for = None;
+                }
                 self.queued_refresh.push_back(req);
                 return;
             }
@@ -879,6 +951,9 @@ impl VersionMgmt {
     }
 
     fn spawn_inner(&mut self, req: TaskRequest) {
+        if req.ext_scan_root.is_some() {
+            self.ext_scan_ready_for = None;
+        }
         let (tx, rx) = mpsc::channel();
         let title = req.title.clone();
         let work = req.work;
@@ -894,6 +969,7 @@ impl VersionMgmt {
             progress: None,
             changes_repository: req.changes_repository,
             repository_access: req.repository_access,
+            ext_scan_root: req.ext_scan_root,
             warnings: Vec::new(),
         };
         if req.is_refresh {
@@ -928,46 +1004,36 @@ impl VersionMgmt {
         let sub_active = body_active;
         match self.tab {
             0 | 1 => self.core.render(f, v[1], cfg, sub_active),
-            2 => self.ext.render(f, v[1], cfg, sub_active),
+            2 => self
+                .ext
+                .render(f, v[1], cfg, sub_active, self.bulk_actions_enabled(cfg)),
             3 => self
                 .install
                 .render(f, v[1], cfg, &self.ext.items, sub_active),
             _ => {}
         }
         if let Some(p) = &self.pending {
-            self.render_pending(f, area, &p.title, p.progress);
+            let detail = match p.progress {
+                Some((done, total)) => TaskTitleDetail::Progress { done, total },
+                None => TaskTitleDetail::None,
+            };
+            self.render_pending(f, area, &p.title, detail);
         } else if let Some(req) = &self.queued_mutation {
-            let title = i18n::t_args("task_waiting_repository", &[("title", &req.title)]);
-            self.render_pending(f, area, &title, None);
+            self.render_pending(f, area, &req.title, TaskTitleDetail::WaitingForRepository);
         }
         if let Some(notice) = &self.result_notice {
             notice.render(f, area);
         }
     }
 
-    fn render_pending(
-        &self,
-        f: &mut Frame,
-        area: Rect,
-        title: &str,
-        progress: Option<(usize, usize)>,
-    ) {
+    fn render_pending(&self, f: &mut Frame, area: Rect, title: &str, detail: TaskTitleDetail) {
         let r = popup::center(area, area.width.saturating_sub(8).min(90), 14);
         popup::clear_widechar_safe(f, r);
-        let suffix = match progress {
-            Some((done, total)) => format!(" ({done}/{total})"),
-            None => String::new(),
-        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(theme::border_type(true))
             .border_style(theme::accent())
-            .title(format!(
-                " {}: {}{} ",
-                i18n::t("popup_working"),
-                title,
-                suffix
-            ));
+            .title(format!(" {} ", format_working_title(title, detail)));
         let inner = Rect {
             x: r.x + 1,
             y: r.y + 1,
@@ -1044,9 +1110,10 @@ impl VersionMgmt {
             return;
         }
         self.sync_core_filter();
+        let bulk_enabled = self.bulk_actions_enabled(cfg);
         let req = match self.tab {
             0 | 1 => self.core.on_mouse(m, body, cfg),
-            2 => self.ext.on_mouse(m, body, cfg),
+            2 => self.ext.on_mouse(m, body, cfg, bulk_enabled),
             3 => {
                 let items = self.ext.items.clone();
                 self.install.on_mouse(m, body, cfg, &items)
@@ -1073,7 +1140,7 @@ impl VersionMgmt {
 
     /// Handles a wheel-scroll event. Routes to the version picker first,
     /// then to the active sub-tab. Ignored while a mutation is in flight.
-    pub fn scroll(&mut self, delta: i32, _cfg: &Config) {
+    pub fn scroll(&mut self, delta: i32, cfg: &Config) {
         if self.is_busy() {
             return;
         }
@@ -1097,9 +1164,10 @@ impl VersionMgmt {
             return;
         }
         self.sync_core_filter();
+        let bulk_enabled = self.bulk_actions_enabled(cfg);
         match self.tab {
             0 | 1 => self.core.scroll(delta),
-            2 => self.ext.scroll(delta),
+            2 => self.ext.scroll(delta, bulk_enabled),
             3 => self.install.scroll(delta),
             _ => {}
         }
@@ -1116,6 +1184,7 @@ impl VersionMgmt {
         if self.is_busy() {
             return;
         }
+        let bulk_enabled = self.bulk_actions_enabled(cfg);
         match code {
             KeyCode::Left => {
                 if self.current_tab_popup_open() {
@@ -1124,7 +1193,7 @@ impl VersionMgmt {
                 }
                 let consumed = match self.tab {
                     0 | 1 => self.core.on_left(),
-                    2 => self.ext.on_left(),
+                    2 => self.ext.on_left(bulk_enabled),
                     3 => self.install.on_left(),
                     _ => false,
                 };
@@ -1140,7 +1209,7 @@ impl VersionMgmt {
                 }
                 let consumed = match self.tab {
                     0 | 1 => self.core.on_right(),
-                    2 => self.ext.on_right(),
+                    2 => self.ext.on_right(bulk_enabled),
                     3 => self.install.on_right(),
                     _ => false,
                 };
@@ -1170,9 +1239,10 @@ impl VersionMgmt {
 
     fn dispatch_current_tab_key(&mut self, code: KeyCode, cfg: &Config) {
         self.sync_core_filter();
+        let bulk_enabled = self.bulk_actions_enabled(cfg);
         let req = match self.tab {
             0 | 1 => self.core.on_key(code, cfg),
-            2 => self.ext.on_key(code, cfg),
+            2 => self.ext.on_key(code, cfg, bulk_enabled),
             3 => {
                 let items = self.ext.items.clone();
                 self.install.on_key(code, cfg, &items)
@@ -1190,6 +1260,151 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn task_titles_compose_status_name_and_optional_detail_in_each_language() {
+        for (language, title, waiting, progress, plain) in [
+            (
+                "zh-CN",
+                "全部更新扩展",
+                "操作中：全部更新扩展（等待当前仓库任务完成）",
+                "操作中：全部更新扩展（1/2）",
+                "操作中：全部更新扩展",
+            ),
+            (
+                "en-US",
+                "Updating all extensions",
+                "Working: Updating all extensions (waiting for the current repository task to finish)",
+                "Working: Updating all extensions (1/2)",
+                "Working: Updating all extensions",
+            ),
+            (
+                "en-UK",
+                "Updating all extensions",
+                "Working: Updating all extensions (waiting for the current repository task to finish)",
+                "Working: Updating all extensions (1/2)",
+                "Working: Updating all extensions",
+            ),
+        ] {
+            i18n::init(language);
+            assert_eq!(i18n::t("task_ext_update_all"), title);
+            assert_eq!(
+                format_working_title(title, TaskTitleDetail::WaitingForRepository),
+                waiting
+            );
+            assert_eq!(
+                format_working_title(title, TaskTitleDetail::Progress { done: 1, total: 2 }),
+                progress
+            );
+            assert_eq!(format_working_title(title, TaskTitleDetail::None), plain);
+            assert!(!format_task_title(title, TaskTitleDetail::None).contains('('));
+        }
+        i18n::init("en-US");
+    }
+
+    #[test]
+    fn bulk_buttons_wait_for_remote_scan_to_finish() {
+        let root = PathBuf::from("/tmp/comfyui-scan-state-test");
+        let mut cfg = Config::default();
+        cfg.general.comfyui_dir = root.display().to_string();
+        let mut screen = VersionMgmt::new();
+        assert!(!screen.bulk_actions_enabled(&cfg));
+
+        let (tx, rx) = mpsc::channel();
+        screen.refresh = Some(PendingTask {
+            title: "extension scan".into(),
+            rx,
+            then: TaskKind::None,
+            progress: None,
+            changes_repository: false,
+            repository_access: RepositoryAccess::Exclusive,
+            ext_scan_root: Some(root.clone()),
+            warnings: Vec::new(),
+        });
+        tx.send(TaskResult::ExtData {
+            items: Vec::new(),
+            root: root.clone(),
+            requested_limit: LIST_MAX_NUM,
+            remote_checked: false,
+        })
+        .unwrap();
+        screen.drain_slot(true);
+        assert!(!screen.bulk_actions_enabled(&cfg));
+
+        tx.send(TaskResult::ExtData {
+            items: Vec::new(),
+            root: root.clone(),
+            requested_limit: LIST_MAX_NUM,
+            remote_checked: true,
+        })
+        .unwrap();
+        screen.drain_slot(true);
+        assert!(!screen.bulk_actions_enabled(&cfg));
+
+        tx.send(TaskResult::Finished(TaskOutcome::PartialFailure(vec![
+            ItemFailure::new("node", "git fetch", "offline"),
+        ])))
+        .unwrap();
+        screen.drain_slot(true);
+        assert!(screen.bulk_actions_enabled(&cfg));
+
+        cfg.general.comfyui_dir = "/tmp/another-comfyui".into();
+        assert!(!screen.bulk_actions_enabled(&cfg));
+    }
+
+    #[test]
+    fn queued_scan_and_failed_scan_keep_bulk_buttons_disabled() {
+        let root = PathBuf::from("/tmp/comfyui-scan-state-test");
+        let mut cfg = Config::default();
+        cfg.general.comfyui_dir = root.display().to_string();
+        let mut screen = VersionMgmt::new();
+        screen.ext_scan_ready_for = Some(root.clone());
+
+        let (tx, rx) = mpsc::channel();
+        screen.refresh = Some(PendingTask {
+            title: "other refresh".into(),
+            rx,
+            then: TaskKind::None,
+            progress: None,
+            changes_repository: false,
+            repository_access: RepositoryAccess::None,
+            ext_scan_root: None,
+            warnings: Vec::new(),
+        });
+        screen.spawn_auto(TaskRequest {
+            title: "queued extension scan".into(),
+            work: Box::new(|_| TaskOutcome::Success),
+            then: TaskKind::None,
+            is_refresh: true,
+            changes_repository: false,
+            repository_access: RepositoryAccess::Exclusive,
+            ext_scan_root: Some(root.clone()),
+        });
+        assert!(!screen.bulk_actions_enabled(&cfg));
+        tx.send(TaskResult::Finished(TaskOutcome::Success)).unwrap();
+        screen.drain_slot(true);
+        assert!(!screen.bulk_actions_enabled(&cfg));
+
+        screen.queued_refresh.clear();
+        screen.ext_scan_ready_for = Some(root.clone());
+        let (tx, rx) = mpsc::channel();
+        screen.refresh = Some(PendingTask {
+            title: "failed extension scan".into(),
+            rx,
+            then: TaskKind::None,
+            progress: None,
+            changes_repository: false,
+            repository_access: RepositoryAccess::Exclusive,
+            ext_scan_root: Some(root),
+            warnings: Vec::new(),
+        });
+        tx.send(TaskResult::Finished(TaskOutcome::failure(
+            "scan", "worker", "failed",
+        )))
+        .unwrap();
+        screen.drain_slot(true);
+        assert!(!screen.bulk_actions_enabled(&cfg));
+    }
 
     #[test]
     fn failed_mutation_does_not_run_its_refresh_follow_up() {
@@ -1215,6 +1430,7 @@ mod tests {
             is_refresh: true,
             changes_repository: false,
             repository_access: RepositoryAccess::Exclusive,
+            ext_scan_root: None,
         });
 
         let ran = Arc::new(AtomicBool::new(false));
@@ -1229,6 +1445,7 @@ mod tests {
             is_refresh: false,
             changes_repository: true,
             repository_access: RepositoryAccess::Exclusive,
+            ext_scan_root: None,
         });
 
         assert!(screen.refresh.is_some());

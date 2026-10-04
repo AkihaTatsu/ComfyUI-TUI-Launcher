@@ -175,4 +175,43 @@ mod launcher_schema_tests {
         assert_eq!(field.default.as_str(), Some("1"));
         assert!(matches!(field.ty, FieldType::Custom));
     }
+
+    #[test]
+    fn launcher_schema_contains_exit_action_choices() {
+        let schema = load_launcher_or_init().expect("embedded launcher schema should parse");
+        let find = |key: &str| {
+            schema
+                .tabs
+                .iter()
+                .flat_map(|tab| &tab.fields)
+                .find(|field| field.key == key)
+                .unwrap_or_else(|| panic!("missing launcher field {key}"))
+        };
+
+        let normal = find("general.normal_exit_action");
+        assert_eq!(normal.default.as_str(), Some("exit"));
+        let FieldType::Choice { options } = &normal.ty else {
+            panic!("normal exit action should be a choice");
+        };
+        assert_eq!(
+            options
+                .iter()
+                .map(|option| option.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["exit", "return_to_launcher"]
+        );
+
+        let crash = find("general.crash_exit_action");
+        assert_eq!(crash.default.as_str(), Some("exit"));
+        let FieldType::Choice { options } = &crash.ty else {
+            panic!("crash exit action should be a choice");
+        };
+        assert_eq!(
+            options
+                .iter()
+                .map(|option| option.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["exit", "return_to_launcher", "auto_restart"]
+        );
+    }
 }

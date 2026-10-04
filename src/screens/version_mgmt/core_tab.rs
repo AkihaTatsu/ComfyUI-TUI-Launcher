@@ -700,6 +700,7 @@ pub fn load_request_with_env(
         is_refresh: true,
         changes_repository: false,
         repository_access: RepositoryAccess::Exclusive,
+        ext_scan_root: None,
         work: Box::new(move |tx| {
             super::warn_if_storage_low(&tx, &root);
             // Fetch first so HEAD/remote refs are current, then deepen if the
@@ -761,6 +762,7 @@ pub fn local_load_request(
         is_refresh: true,
         changes_repository: false,
         repository_access: RepositoryAccess::None,
+        ext_scan_root: None,
         work: Box::new(move |tx| {
             let scan = scan_local(&root, limit);
             let _ = tx.send(TaskResult::CoreData {
@@ -794,6 +796,7 @@ fn pull_request(
         is_refresh: false,
         changes_repository: true,
         repository_access: RepositoryAccess::Exclusive,
+        ext_scan_root: None,
         work: Box::new(move |tx| {
             super::warn_if_storage_low(&tx, &root);
             // Same fetch+reset strategy as extensions: works for detached
@@ -840,6 +843,7 @@ fn checkout_request(
         is_refresh: false,
         changes_repository: true,
         repository_access: RepositoryAccess::Exclusive,
+        ext_scan_root: None,
         work: Box::new(move |tx| {
             super::warn_if_storage_low(&tx, &root);
             let checkout_ok = git::checkout(&root, &rev, env_vars.clone()).unwrap_or(false);

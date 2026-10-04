@@ -71,6 +71,11 @@ impl Button {
         self.pending = Some(false);
     }
 
+    /// Discards a click that was armed before the button became unavailable.
+    pub fn cancel_pending(&mut self) {
+        self.pending = None;
+    }
+
     /// Polls the deferred-fire pipeline once per tick.
     ///
     /// Returns `true` exactly once, on the second tick after `click()`.
@@ -90,19 +95,39 @@ impl Button {
 
     /// Renders the button with `label` into `area`.
     pub fn render(&self, f: &mut Frame, area: Rect, label: &str, focused: bool) {
-        let text_style: Style = match (self.kind, focused) {
-            (ButtonKind::Default, false) => theme::base(),
-            (ButtonKind::Primary, false) => theme::accent(),
-            (ButtonKind::Danger, false) => theme::danger(),
-            (ButtonKind::Danger, true) => theme::focused_danger(),
-            (_, true) => theme::focused(),
+        self.render_enabled(f, area, label, focused, true);
+    }
+
+    /// Renders a disabled button dimly, without a focus highlight.
+    pub fn render_enabled(
+        &self,
+        f: &mut Frame,
+        area: Rect,
+        label: &str,
+        focused: bool,
+        enabled: bool,
+    ) {
+        let text_style: Style = if !enabled {
+            theme::placeholder()
+        } else {
+            match (self.kind, focused) {
+                (ButtonKind::Default, false) => theme::base(),
+                (ButtonKind::Primary, false) => theme::accent(),
+                (ButtonKind::Danger, false) => theme::danger(),
+                (ButtonKind::Danger, true) => theme::focused_danger(),
+                (_, true) => theme::focused(),
+            }
         };
         // The border stays plain regardless of focus; only the interior
         // label reflects focus through a reverse-video highlight.
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(theme::border_type(false))
-            .border_style(theme::border());
+            .border_style(if enabled {
+                theme::border()
+            } else {
+                theme::placeholder()
+            });
         let para = Paragraph::new(Line::from(label.to_string()))
             .style(text_style)
             .alignment(ratatui::layout::Alignment::Center)

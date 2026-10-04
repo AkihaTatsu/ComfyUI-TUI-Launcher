@@ -21,6 +21,9 @@ pub struct Cmd {
     pub cwd: Option<PathBuf>,
     /// Additional environment variables.
     pub env: HashMap<String, String>,
+    /// Optional concise argument rendering for commands whose real arguments
+    /// contain large embedded helpers.
+    pub display_args: Option<String>,
 }
 
 impl Cmd {
@@ -31,6 +34,7 @@ impl Cmd {
             args: vec![],
             cwd: None,
             env: HashMap::new(),
+            display_args: None,
         }
     }
     /// Appends one argument.
@@ -41,6 +45,16 @@ impl Cmd {
     /// Merges the given environment variables into the command.
     pub fn envs(mut self, e: HashMap<String, String>) -> Self {
         self.env.extend(e);
+        self
+    }
+    /// Sets the child working directory.
+    pub fn current_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.cwd = Some(path.into());
+        self
+    }
+    /// Overrides only the argument text written to the task log.
+    pub fn display_args(mut self, args: impl Into<String>) -> Self {
+        self.display_args = Some(args.into());
         self
     }
 }
@@ -54,9 +68,10 @@ impl Cmd {
 pub fn run_logged(source: &str, c: Cmd) -> Result<bool> {
     use std::thread;
 
+    let displayed_args = c.display_args.clone().unwrap_or_else(|| c.args.join(" "));
     log_bus::push(
         source,
-        format!("$ {} {}", c.program.display(), c.args.join(" ")),
+        format!("$ {} {displayed_args}", c.program.display()),
     );
     let mut cmd = Command::new(&c.program);
     cmd.args(&c.args)
@@ -78,12 +93,12 @@ pub fn run_logged(source: &str, c: Cmd) -> Result<bool> {
 
     let h_out = stdout.map(|s| {
         thread::spawn(move || {
-            stream_output(s, &src_o, "stdout", "");
+            stream_output(s, &src_o, "stdout");
         })
     });
     let h_err = stderr.map(|s| {
         thread::spawn(move || {
-            stream_output(s, &src_e, "stderr", "err: ");
+            stream_output(s, &src_e, "stderr");
         })
     });
 
@@ -98,7 +113,7 @@ pub fn run_logged(source: &str, c: Cmd) -> Result<bool> {
     Ok(status.success())
 }
 
-fn stream_output<R: Read>(mut reader: R, source: &str, stream: &str, prefix: &str) {
+fn stream_output<R: Read>(mut reader: R, source: &str, stream: &str) {
     let progress_key = format!("{source}:{stream}");
     let mut pending = Vec::<u8>::new();
     let mut had_progress = false;
@@ -113,12 +128,12 @@ fn stream_output<R: Read>(mut reader: R, source: &str, stream: &str, prefix: &st
         for &b in &buf[..n] {
             match b {
                 b'\r' => {
-                    push_pending_progress(source, &progress_key, prefix, &pending);
+                    push_pending_progress(source, &progress_key, &pending);
                     pending.clear();
                     had_progress = true;
                 }
                 b'\n' => {
-                    push_pending_line(source, &progress_key, prefix, &pending, had_progress);
+                    push_pending_line(source, &progress_key, &pending, had_progress);
                     pending.clear();
                     had_progress = false;
                 }
@@ -128,28 +143,27 @@ fn stream_output<R: Read>(mut reader: R, source: &str, stream: &str, prefix: &st
     }
 
     if !pending.is_empty() {
-        push_pending_line(source, &progress_key, prefix, &pending, had_progress);
+        push_pending_line(source, &progress_key, &pending, had_progress);
     }
 }
 
-fn push_pending_progress(source: &str, key: &str, prefix: &str, pending: &[u8]) {
+fn push_pending_progress(source: &str, key: &str, pending: &[u8]) {
     if pending.is_empty() {
         return;
     }
     let text = String::from_utf8_lossy(pending);
-    log_bus::push_progress(source, key, format!("{prefix}{text}"));
+    log_bus::push_progress(source, key, text);
 }
 
-fn push_pending_line(source: &str, key: &str, prefix: &str, pending: &[u8], had_progress: bool) {
+fn push_pending_line(source: &str, key: &str, pending: &[u8], had_progress: bool) {
     if pending.is_empty() {
         return;
     }
     let text = String::from_utf8_lossy(pending);
-    let text = format!("{prefix}{text}");
     if had_progress {
-        log_bus::push_progress(source, key, text);
+        log_bus::push_progress(source, key, text.as_ref());
     } else {
-        log_bus::push(source, text);
+        log_bus::push(source, text.as_ref());
     }
 }
 
@@ -238,8 +252,8 @@ pub fn launch_comfyui_and_exit(
     }
 }
 
-/// Crash auto-restart tuning, all in seconds/counts. Only consulted when the
-/// supervisor path is taken (i.e. the launcher-settings toggle is on).
+/// Crash auto-restart tuning, all in seconds/counts.
+#[derive(Debug, Clone, Copy)]
 pub struct RestartPolicy {
     /// Seconds to wait before each restart.
     pub delay_secs: u64,
@@ -247,6 +261,15 @@ pub struct RestartPolicy {
     pub window_secs: u64,
     /// If crashes within the window exceed this, the supervisor gives up.
     pub max_fails: u32,
+}
+
+/// Final result of a supervised ComfyUI run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// ComfyUI exited cleanly or was intentionally stopped.
+    Normal { exit_code: i32 },
+    /// ComfyUI failed and any configured restart budget was exhausted.
+    Crash { exit_code: i32 },
 }
 
 /// Set by our signal / console-control handler when the user or terminal asks
@@ -305,10 +328,50 @@ fn loop_protection_tripped(
     recent as u32 > max
 }
 
+/// Restores the process handlers that were active before a supervised run.
+struct StopHandlerGuard {
+    #[cfg(unix)]
+    previous: Vec<(nix::sys::signal::Signal, nix::sys::signal::SigAction)>,
+    #[cfg(windows)]
+    installed: bool,
+}
+
+impl Drop for StopHandlerGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        for (signal, action) in self.previous.drain(..).rev() {
+            // Safety: restore the exact handler returned by `sigaction`.
+            unsafe {
+                let _ = nix::sys::signal::sigaction(signal, &action);
+            }
+        }
+
+        #[cfg(windows)]
+        if self.installed {
+            // Safety: unregister the same static callback installed below.
+            unsafe {
+                windows_sys::Win32::System::Console::SetConsoleCtrlHandler(
+                    Some(on_console_stop),
+                    0,
+                );
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn on_console_stop(_ctrl_type: u32) -> i32 {
+    USER_STOP.store(true, Ordering::SeqCst);
+    1 // TRUE: handled (and stops the default "terminate launcher" action)
+}
+
 /// Installs handlers so a stop request flips [`USER_STOP`] instead of killing
-/// the launcher outright, letting the supervisor reap the child and decide
-/// whether to restart. The handlers only set an atomic flag (async-signal-safe).
-fn install_stop_handlers() {
+/// the launcher outright, letting the supervisor reap the child and classify
+/// its exit. The returned guard restores the prior handlers before the TUI is
+/// entered again.
+fn install_stop_handlers() -> StopHandlerGuard {
+    USER_STOP.store(false, Ordering::SeqCst);
+
     #[cfg(unix)]
     {
         use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
@@ -320,6 +383,7 @@ fn install_stop_handlers() {
             SaFlags::empty(),
             SigSet::empty(),
         );
+        let mut previous = Vec::new();
         for sig in [
             Signal::SIGINT,
             Signal::SIGTERM,
@@ -328,21 +392,20 @@ fn install_stop_handlers() {
         ] {
             // Safety: the handler only performs an atomic store.
             unsafe {
-                let _ = sigaction(sig, &action);
+                if let Ok(old) = sigaction(sig, &action) {
+                    previous.push((sig, old));
+                }
             }
         }
+        StopHandlerGuard { previous }
     }
+
     #[cfg(windows)]
     {
         use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
-        unsafe extern "system" fn on_ctrl(_ctrl_type: u32) -> i32 {
-            USER_STOP.store(true, Ordering::SeqCst);
-            1 // TRUE: handled (and stops the default "terminate launcher" action)
-        }
         // Safety: registering a console control handler with a static fn.
-        unsafe {
-            SetConsoleCtrlHandler(Some(on_ctrl), 1);
-        }
+        let installed = unsafe { SetConsoleCtrlHandler(Some(on_console_stop), 1) != 0 };
+        StopHandlerGuard { installed }
     }
 }
 
@@ -404,77 +467,101 @@ fn wait_or_stop(child: &mut std::process::Child) -> std::io::Result<std::process
     }
 }
 
+/// Waits out a restart delay while still allowing Ctrl+C to cancel it.
+fn wait_restart_delay(delay: Duration) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < delay {
+        if USER_STOP.load(Ordering::SeqCst) {
+            return true;
+        }
+        let remaining = delay.saturating_sub(started.elapsed());
+        std::thread::sleep(remaining.min(Duration::from_millis(100)));
+    }
+    USER_STOP.load(Ordering::SeqCst)
+}
+
 /// Supervises ComfyUI: spawns it as a child (inheriting stdio so its console is
-/// shown exactly as before), and on an *unexpected crash* relaunches it with the
-/// same `python`, `args`, and `env`. Intentional shutdowns (Ctrl+C → exit 0,
-/// window/terminal close, `kill`) and clean exits do not restart. Crash-loop
-/// protection bounds rapid failures per [`RestartPolicy`]. Does not return.
-pub fn supervise_comfyui_and_exit(
+/// shown exactly as before), classifies its final exit, and optionally retries
+/// unexpected crashes. Manager-requested reboots are always immediate and do
+/// not consume the crash budget.
+pub fn run_comfyui_supervised(
     python: &Path,
     comfy_dir: &Path,
     args: Vec<String>,
     env: HashMap<String, String>,
-    policy: RestartPolicy,
-) -> ! {
+    restart_policy: Option<RestartPolicy>,
+) -> RunOutcome {
     use crate::core::i18n;
 
     let main_py = comfy_dir.join("main.py");
     let full = comfyui_python_args(&main_py, args, &env);
 
-    install_stop_handlers();
-    notice(&i18n::t("restart_supervisor_banner"));
+    let _stop_handlers = install_stop_handlers();
+    if restart_policy.is_some() {
+        notice(&i18n::t("restart_supervisor_banner"));
+    }
 
     let started = Instant::now();
-    let window = Duration::from_secs(policy.window_secs);
     let mut crashes: Vec<Duration> = Vec::new();
 
     loop {
+        if USER_STOP.load(Ordering::SeqCst) {
+            notice(&i18n::t("restart_stopped"));
+            return RunOutcome::Normal { exit_code: 0 };
+        }
         let mut cmd = comfyui_command(python, &full, &env);
         log_bus::push("launch", format!("spawn python {}", display_args(&full)));
 
         // A spawn failure is treated like a crash so a transient problem can
         // recover, while a permanent one trips loop protection and gives up.
-        let exit_code: i32 = match cmd.spawn() {
-            Ok(mut child) => {
-                let status = match wait_or_stop(&mut child) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        notice(&format!("wait failed: {e}"));
-                        let _ = child.kill();
-                        std::process::exit(1);
+        let exit_code = match cmd.spawn() {
+            Ok(mut child) => match wait_or_stop(&mut child) {
+                Ok(status) => {
+                    let user_stop = USER_STOP.load(Ordering::SeqCst);
+                    if !user_stop && manager_reboot_requested() {
+                        // Explicit Manager restart: relaunch immediately, not a crash.
+                        continue;
                     }
-                };
 
-                if USER_STOP.load(Ordering::SeqCst) {
-                    notice(&i18n::t("restart_stopped"));
-                    std::process::exit(status.code().unwrap_or(0));
+                    #[cfg(unix)]
+                    let term_signal = std::os::unix::process::ExitStatusExt::signal(&status);
+                    #[cfg(not(unix))]
+                    let term_signal: Option<i32> = None;
+
+                    match classify_exit(status.success(), term_signal, user_stop) {
+                        ExitClass::Stopped => {
+                            notice(&i18n::t("restart_stopped"));
+                            return RunOutcome::Normal {
+                                exit_code: status.code().unwrap_or(0),
+                            };
+                        }
+                        ExitClass::Crash => status.code().unwrap_or(1),
+                    }
                 }
-                if manager_reboot_requested() {
-                    // Explicit Manager restart: relaunch immediately, not a crash.
-                    continue;
-                }
-
-                #[cfg(unix)]
-                let term_signal = std::os::unix::process::ExitStatusExt::signal(&status);
-                #[cfg(not(unix))]
-                let term_signal: Option<i32> = None;
-
-                match classify_exit(status.success(), term_signal, false) {
-                    ExitClass::Stopped => {
+                Err(e) => {
+                    notice(&format!("wait failed: {e}"));
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    if USER_STOP.load(Ordering::SeqCst) {
                         notice(&i18n::t("restart_stopped"));
-                        std::process::exit(status.code().unwrap_or(0));
+                        return RunOutcome::Normal { exit_code: 0 };
                     }
-                    ExitClass::Crash => status.code().unwrap_or(1),
+                    1
                 }
-            }
+            },
             Err(e) => {
                 notice(&format!("spawn failed: {e}"));
-                -1
+                1
             }
+        };
+
+        let Some(policy) = restart_policy else {
+            return RunOutcome::Crash { exit_code };
         };
 
         // Record the crash and enforce loop protection.
         let now = started.elapsed();
+        let window = Duration::from_secs(policy.window_secs);
         crashes.retain(|&t| now.checked_sub(t).is_some_and(|age| age <= window));
         crashes.push(now);
         if loop_protection_tripped(&crashes, now, window, policy.max_fails) {
@@ -485,7 +572,7 @@ pub fn supervise_comfyui_and_exit(
                     ("window", &policy.window_secs.to_string()),
                 ],
             ));
-            std::process::exit(1);
+            return RunOutcome::Crash { exit_code };
         }
 
         notice(&i18n::t_args(
@@ -497,7 +584,10 @@ pub fn supervise_comfyui_and_exit(
                 ("max", &policy.max_fails.to_string()),
             ],
         ));
-        std::thread::sleep(Duration::from_secs(policy.delay_secs));
+        if wait_restart_delay(Duration::from_secs(policy.delay_secs)) {
+            notice(&i18n::t("restart_stopped"));
+            return RunOutcome::Normal { exit_code: 0 };
+        }
     }
 }
 
@@ -651,13 +741,12 @@ mod tests {
     }
 
     #[test]
-    fn carriage_return_progress_replaces_one_log_line() {
+    fn stderr_progress_replaces_one_log_line_without_an_error_prefix() {
         let source = "progress_replaces_one_log_line";
         stream_output(
             std::io::Cursor::new(b"0%\r50%\r100%\n".to_vec()),
             source,
             "stderr",
-            "err: ",
         );
 
         let snap = crate::core::log_bus::snapshot();
@@ -668,7 +757,7 @@ mod tests {
             .collect();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].source, source);
-        assert_eq!(got[0].text, "err: 100%");
+        assert_eq!(got[0].text, "100%");
     }
 
     #[test]
@@ -678,7 +767,6 @@ mod tests {
             std::io::Cursor::new(b"a\nb\nc\n".to_vec()),
             source,
             "stdout",
-            "",
         );
 
         let snap = crate::core::log_bus::snapshot();
@@ -692,5 +780,23 @@ mod tests {
             .iter()
             .filter(|line| line.source == source)
             .all(|line| line.progress_key.is_none()));
+    }
+
+    #[test]
+    fn stderr_newlines_are_preserved_without_an_error_prefix() {
+        let source = "stderr_newlines_without_error_prefix";
+        stream_output(
+            std::io::Cursor::new(b"notice\nWARNING: example\nERROR: original\n".to_vec()),
+            source,
+            "stderr",
+        );
+
+        let snap = crate::core::log_bus::snapshot();
+        let got: Vec<&str> = snap
+            .iter()
+            .filter(|line| line.source == source)
+            .map(|line| line.text.as_str())
+            .collect();
+        assert_eq!(got, vec!["notice", "WARNING: example", "ERROR: original"]);
     }
 }

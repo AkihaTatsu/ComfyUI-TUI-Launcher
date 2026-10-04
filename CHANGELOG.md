@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added ComfyUI-Manager-compatible custom-node post-install handling: node
+  dependencies and `install.py` now run after installs, updates, reinstalls,
+  and version changes, with the installed Manager preferred and a built-in
+  compatibility backend available when Manager cannot load.
+- Added independent actions for normal ComfyUI exits and crashes, including
+  returning to a fresh launcher screen and bounded automatic crash restarts.
+
+### Changed
+- Custom-node post-install failures now report the failing dependency, script,
+  or repair stage without retrying an `install.py` that may already have run.
+
+### Fixed
+- The launcher log page now returns to the newest entries whenever it is
+  entered, follows new output at the bottom, and preserves a manually scrolled
+  viewport until the user reaches the bottom again.
+- Child-process stderr is now preserved without the misleading synthetic
+  `err:` prefix; command exit status and original error text remain visible.
+
 ## [0.2.0] - 2026-09-02
 
 ### Added

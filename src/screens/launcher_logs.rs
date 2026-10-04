@@ -35,6 +35,11 @@ impl LauncherLogs {
         }
     }
 
+    /// Resets the viewport whenever this screen is entered from another page.
+    pub fn on_enter(&self) {
+        self.log.reset_to_tail();
+    }
+
     /// Drains and returns the pending flash message, if any.
     pub fn take_flash(&mut self) -> Option<(crate::app::FlashKind, String)> {
         self.pending_flash.take()

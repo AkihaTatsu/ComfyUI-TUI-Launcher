@@ -8,10 +8,12 @@
 
 - **Works everywhere a terminal does** - SSH sessions, Docker containers, headless servers, WSL, etc.
 - **Full version management** - Switch between stable release tags or any individual commit; update, rollback, enable, disable, or uninstall extensions one by one.
+- **Manager-compatible node setup** - Node installs and source changes process Python dependencies and `install.py`, preferring the installed ComfyUI-Manager policy with a built-in fallback.
 - **Portable version** - Build with `--features portable` and everything the launcher owns lives under `<exe_dir>/local_data/`.
 - **Mouse and keyboard** - A full TUI with resize support; works with a mouse where the terminal allows it, fully operable by keyboard alone. Key bindings are provided below, which dynamically change according to the current focus, so that you do not need to remember any hotkeys.
 - **i18n support** - Switch the interface language instantly without restarting. Add your own by dropping a TOML file into `assets/i18n/`.
 - **Mirrors and accelerations** - Configure your own GitHub, Huggingface, etc. proxy/mirror endpoints.
+- **Configurable process lifecycle** - Choose whether normal exits and crashes close the launcher, return to a fresh launcher screen, or automatically retry after crashes.
 
 ## Installation
 

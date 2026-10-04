@@ -316,6 +316,22 @@ impl LogDisplay {
         }
     }
 
+    /// Moves the viewport to the newest visual rows and resumes following
+    /// future source revisions.
+    pub fn reset_to_tail(&self) {
+        self.follow_tail.set(true);
+        self.scroll.set(
+            self.total_rows
+                .get()
+                .saturating_sub(self.visible_rows.get()),
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_following_tail(&self) -> bool {
+        self.follow_tail.get()
+    }
+
     /// Renders logs and optional chrome using the current source revision.
     pub fn render(
         &self,
@@ -455,8 +471,8 @@ impl LogDisplay {
                 offset = 0;
             }
             LogNavigation::End => {
-                self.follow_tail.set(true);
-                offset = max_offset;
+                self.reset_to_tail();
+                return;
             }
         }
         self.scroll.set(offset);
@@ -818,6 +834,51 @@ mod tests {
         assert_eq!(display.scroll.get(), 0);
         display.navigate(LogNavigation::End);
         assert_eq!(display.scroll.get(), 15);
+    }
+
+    #[test]
+    fn new_logs_follow_only_while_viewport_is_at_tail() {
+        let mut data = source(&[
+            "one", "two", "three", "four", "five", "six", "seven", "eight",
+        ]);
+        let display = LogDisplay::new();
+        let mut terminal = Terminal::new(TestBackend::new(40, 3)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                display.render(frame, frame.area(), &data, LogDisplayOptions::default());
+            })
+            .expect("initial render");
+        assert_eq!(display.scroll.get(), 5);
+        assert!(display.follow_tail.get());
+
+        display.navigate(LogNavigation::Lines(-1));
+        assert_eq!(display.scroll.get(), 4);
+        assert!(!display.follow_tail.get());
+
+        data.revision = 2;
+        data.lines.push(log_bus::LogLine::test(9, "test", "nine"));
+        terminal
+            .draw(|frame| {
+                display.render(frame, frame.area(), &data, LogDisplayOptions::default());
+            })
+            .expect("paused render");
+        assert_eq!(display.scroll.get(), 4);
+        assert!(!display.follow_tail.get());
+
+        display.navigate(LogNavigation::Lines(1));
+        assert!(!display.follow_tail.get());
+        display.navigate(LogNavigation::Lines(1));
+        assert_eq!(display.scroll.get(), 6);
+        assert!(display.follow_tail.get());
+
+        data.revision = 3;
+        data.lines.push(log_bus::LogLine::test(10, "test", "ten"));
+        terminal
+            .draw(|frame| {
+                display.render(frame, frame.area(), &data, LogDisplayOptions::default());
+            })
+            .expect("following render");
+        assert_eq!(display.scroll.get(), 7);
     }
 
     #[test]

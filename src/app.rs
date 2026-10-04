@@ -4,7 +4,7 @@
 //! transient banners. `tick`, `draw`, `on_key`, and `on_mouse` are the
 //! four entry points called by `main.rs` once per loop iteration.
 
-use crate::core::config::Config;
+use crate::core::config::{Config, CrashExitAction, NormalExitAction};
 use crate::core::schema::Schema;
 use crate::core::{env, i18n, log_bus, process, schema, theme};
 use crate::screens::{
@@ -26,6 +26,38 @@ use std::cell::Cell;
 /// to its minimum.
 pub const MIN_VIEWPORT_WIDTH: u16 = 40;
 pub const MIN_VIEWPORT_HEIGHT: u16 = 8;
+
+/// What the binary should do after a supervised ComfyUI run finishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchOutcome {
+    /// Recreate and show the launcher TUI.
+    ReturnToLauncher,
+    /// End the launcher with the supplied process exit code.
+    Exit(i32),
+}
+
+fn launch_needs_supervision(normal: NormalExitAction, crash: CrashExitAction) -> bool {
+    normal != NormalExitAction::Exit || crash != CrashExitAction::Exit
+}
+
+fn launch_outcome(
+    result: process::RunOutcome,
+    normal: NormalExitAction,
+    crash: CrashExitAction,
+) -> LaunchOutcome {
+    match result {
+        process::RunOutcome::Normal { exit_code } => match normal {
+            NormalExitAction::Exit => LaunchOutcome::Exit(exit_code),
+            NormalExitAction::ReturnToLauncher => LaunchOutcome::ReturnToLauncher,
+        },
+        process::RunOutcome::Crash { exit_code } => match crash {
+            CrashExitAction::ReturnToLauncher => LaunchOutcome::ReturnToLauncher,
+            // AutoRestart reaches this point only after loop protection gives
+            // up, so its terminal action is to end with the failure status.
+            CrashExitAction::Exit | CrashExitAction::AutoRestart => LaunchOutcome::Exit(exit_code),
+        },
+    }
+}
 
 /// Whether the terminal currently has enough cells for the full layout.
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -869,7 +901,7 @@ impl App {
     }
 
     fn sync_screen(&mut self) {
-        self.screen = match self.menu.selected {
+        let next = match self.menu.selected {
             0 => Screen::Main,
             1 => Screen::ComfySettings,
             2 => Screen::VersionMgmt,
@@ -877,32 +909,38 @@ impl App {
             4 => Screen::LauncherLogs,
             _ => Screen::About,
         };
+        if self.screen != next && next == Screen::LauncherLogs {
+            self.logs.on_enter();
+        }
+        self.screen = next;
     }
 
-    /// Launches ComfyUI and exits. With crash auto-restart off this replaces
-    /// the process with ComfyUI (unchanged behaviour); with it on the launcher
-    /// stays alive as a supervisor that relaunches ComfyUI after a crash.
-    pub fn do_launch(self) -> ! {
+    /// Launches ComfyUI and applies the configured normal/crash lifecycle
+    /// actions. The all-default configuration preserves the historical direct
+    /// launch path; other combinations supervise the child and return a final
+    /// disposition to `main.rs`.
+    pub fn do_launch(self) -> LaunchOutcome {
         let args = schema::build_cli_args(&self.schema, &self.cfg.comfy_settings);
         let env = env::build(&self.cfg.network);
         let python = std::path::Path::new(&self.cfg.general.python);
         let comfy_dir = std::path::Path::new(&self.cfg.general.comfyui_dir);
-        if self.cfg.general.crash_auto_restart {
-            log_bus::push("launch", format!("supervise python {}", args.join(" ")));
-            process::supervise_comfyui_and_exit(
-                python,
-                comfy_dir,
-                args,
-                env,
-                process::RestartPolicy {
-                    delay_secs: self.cfg.general.crash_restart_delay_secs,
-                    window_secs: self.cfg.general.crash_restart_window_secs,
-                    max_fails: self.cfg.general.crash_restart_max_fails,
-                },
-            );
+        let normal_action = self.cfg.general.normal_exit_action;
+        let crash_action = self.cfg.general.crash_exit_action;
+
+        if !launch_needs_supervision(normal_action, crash_action) {
+            log_bus::push("launch", format!("execvp python {}", args.join(" ")));
+            process::launch_comfyui_and_exit(python, comfy_dir, args, env);
         }
-        log_bus::push("launch", format!("execvp python {}", args.join(" ")));
-        process::launch_comfyui_and_exit(python, comfy_dir, args, env);
+
+        let restart_policy =
+            (crash_action == CrashExitAction::AutoRestart).then_some(process::RestartPolicy {
+                delay_secs: self.cfg.general.crash_restart_delay_secs,
+                window_secs: self.cfg.general.crash_restart_window_secs,
+                max_fails: self.cfg.general.crash_restart_max_fails,
+            });
+        log_bus::push("launch", format!("supervise python {}", args.join(" ")));
+        let result = process::run_comfyui_supervised(python, comfy_dir, args, env, restart_policy);
+        launch_outcome(result, normal_action, crash_action)
     }
 }
 
@@ -920,5 +958,77 @@ mod tests {
             viewport_mode(MIN_VIEWPORT_WIDTH, MIN_VIEWPORT_HEIGHT - 1) == ViewportMode::TooSmall
         );
         assert!(viewport_mode(MIN_VIEWPORT_WIDTH, MIN_VIEWPORT_HEIGHT) == ViewportMode::Ready);
+    }
+
+    #[test]
+    fn entering_logs_rearms_tail_without_resetting_on_focus_changes() {
+        let mut app = App::new(Config::default(), Schema::default());
+        app.logs
+            .log
+            .navigate(crate::widgets::log_display::LogNavigation::Home);
+        assert!(!app.logs.log.is_following_tail());
+
+        app.menu.selected = 4;
+        app.sync_screen();
+        assert!(app.screen == Screen::LauncherLogs);
+        assert!(app.logs.log.is_following_tail());
+
+        app.logs
+            .log
+            .navigate(crate::widgets::log_display::LogNavigation::Home);
+        app.sync_screen();
+        assert!(!app.logs.log.is_following_tail());
+    }
+
+    #[test]
+    fn only_all_exit_defaults_skip_supervision() {
+        assert!(!launch_needs_supervision(
+            NormalExitAction::Exit,
+            CrashExitAction::Exit
+        ));
+        assert!(launch_needs_supervision(
+            NormalExitAction::ReturnToLauncher,
+            CrashExitAction::Exit
+        ));
+        assert!(launch_needs_supervision(
+            NormalExitAction::Exit,
+            CrashExitAction::AutoRestart
+        ));
+    }
+
+    #[test]
+    fn final_run_results_follow_independent_actions() {
+        assert_eq!(
+            launch_outcome(
+                process::RunOutcome::Normal { exit_code: 0 },
+                NormalExitAction::ReturnToLauncher,
+                CrashExitAction::Exit,
+            ),
+            LaunchOutcome::ReturnToLauncher
+        );
+        assert_eq!(
+            launch_outcome(
+                process::RunOutcome::Crash { exit_code: 7 },
+                NormalExitAction::ReturnToLauncher,
+                CrashExitAction::Exit,
+            ),
+            LaunchOutcome::Exit(7)
+        );
+        assert_eq!(
+            launch_outcome(
+                process::RunOutcome::Crash { exit_code: 9 },
+                NormalExitAction::Exit,
+                CrashExitAction::ReturnToLauncher,
+            ),
+            LaunchOutcome::ReturnToLauncher
+        );
+        assert_eq!(
+            launch_outcome(
+                process::RunOutcome::Crash { exit_code: 1 },
+                NormalExitAction::Exit,
+                CrashExitAction::AutoRestart,
+            ),
+            LaunchOutcome::Exit(1)
+        );
     }
 }

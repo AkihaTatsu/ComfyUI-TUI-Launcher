@@ -15,6 +15,90 @@ use toml::Value;
 /// Upper bound for user-configured Git workers inside one batch task.
 pub const MAX_GIT_CONCURRENCY: usize = 32;
 
+/// What the launcher should do after ComfyUI stops normally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NormalExitAction {
+    /// End the launcher process.
+    #[default]
+    Exit,
+    /// Start a fresh launcher TUI session.
+    ReturnToLauncher,
+}
+
+impl NormalExitAction {
+    /// Stable value persisted in `launcher_config.toml`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Exit => "exit",
+            Self::ReturnToLauncher => "return_to_launcher",
+        }
+    }
+
+    /// Parses a persisted settings value.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "exit" => Some(Self::Exit),
+            "return_to_launcher" => Some(Self::ReturnToLauncher),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for NormalExitAction {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(Self::parse(&value).unwrap_or_default())
+    }
+}
+
+/// What the launcher should do after ComfyUI crashes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CrashExitAction {
+    /// End the launcher process.
+    #[default]
+    Exit,
+    /// Start a fresh launcher TUI session.
+    ReturnToLauncher,
+    /// Relaunch ComfyUI, subject to the configured crash-loop limits.
+    AutoRestart,
+}
+
+impl CrashExitAction {
+    /// Stable value persisted in `launcher_config.toml`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Exit => "exit",
+            Self::ReturnToLauncher => "return_to_launcher",
+            Self::AutoRestart => "auto_restart",
+        }
+    }
+
+    /// Parses a persisted settings value.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "exit" => Some(Self::Exit),
+            "return_to_launcher" => Some(Self::ReturnToLauncher),
+            "auto_restart" => Some(Self::AutoRestart),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CrashExitAction {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(Self::parse(&value).unwrap_or_default())
+    }
+}
+
 // Defaults for `launcher_config.toml` mirror the entries in
 // `launcher_schema.toml`. On first run the file is instantiated via serde's
 // `Default` impls so the two stay in sync.
@@ -38,21 +122,23 @@ pub struct General {
     /// extension scans and bulk operations.
     #[serde(default = "default_git_concurrency")]
     pub git_concurrency: usize,
-    /// When enabled, the launcher stays alive as a supervisor and restarts
-    /// ComfyUI after an unexpected crash. See [`crate::core::process`].
+    /// Action taken after a clean exit or an intentional stop such as Ctrl+C.
     #[serde(default)]
-    pub crash_auto_restart: bool,
+    pub normal_exit_action: NormalExitAction,
+    /// Action taken after a non-zero exit, fatal signal, or launch failure.
+    #[serde(default)]
+    pub crash_exit_action: CrashExitAction,
     /// Seconds to wait before each restart (only used when
-    /// `crash_auto_restart` is on).
+    /// `crash_exit_action` is `auto_restart`).
     #[serde(default = "default_restart_delay")]
     pub crash_restart_delay_secs: u64,
     /// Sliding window, in seconds, over which crashes are counted for
-    /// crash-loop protection (only used when `crash_auto_restart` is on).
+    /// crash-loop protection (only used for `auto_restart`).
     #[serde(default = "default_restart_window")]
     pub crash_restart_window_secs: u64,
     /// If the number of crashes within `crash_restart_window_secs` exceeds
-    /// this, the supervisor gives up instead of restarting (only used when
-    /// `crash_auto_restart` is on).
+    /// this, the supervisor gives up instead of restarting (only used for
+    /// `auto_restart`).
     #[serde(default = "default_restart_max_fails")]
     pub crash_restart_max_fails: u32,
 }
@@ -95,7 +181,8 @@ impl Default for General {
             language: default_lang(),
             mode: default_mode(),
             git_concurrency: default_git_concurrency(),
-            crash_auto_restart: false,
+            normal_exit_action: NormalExitAction::default(),
+            crash_exit_action: CrashExitAction::default(),
             crash_restart_delay_secs: default_restart_delay(),
             crash_restart_window_secs: default_restart_window(),
             crash_restart_max_fails: default_restart_max_fails(),
@@ -217,7 +304,10 @@ impl Config {
         let lpath = paths::config_file();
         let mut lfile: LauncherFile = if lpath.exists() {
             let ltext = std::fs::read_to_string(&lpath).context("read launcher config")?;
-            toml::from_str(&ltext).context("parse launcher config")?
+            let mut parsed: LauncherFile =
+                toml::from_str(&ltext).context("parse launcher config")?;
+            migrate_legacy_exit_action(&ltext, &mut parsed);
+            parsed
         } else {
             let fresh = LauncherFile::default();
             let _ = std::fs::write(&lpath, toml::to_string_pretty(&fresh).unwrap_or_default());
@@ -319,6 +409,28 @@ impl Config {
     }
 }
 
+/// Migrates the former crash-only boolean without overriding an explicitly
+/// configured replacement field. The next canonical save drops the unknown
+/// legacy key from the serialized file.
+fn migrate_legacy_exit_action(text: &str, file: &mut LauncherFile) {
+    let Ok(raw) = toml::from_str::<Value>(text) else {
+        return;
+    };
+    let Some(general) = raw.get("general").and_then(Value::as_table) else {
+        return;
+    };
+    if general.contains_key("crash_exit_action") {
+        return;
+    }
+    if general
+        .get("crash_auto_restart")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        file.general.crash_exit_action = CrashExitAction::AutoRestart;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,6 +440,8 @@ mod tests {
         let file: LauncherFile = toml::from_str("[general]\nmode = 'advanced'\n")
             .expect("legacy launcher config should parse");
         assert_eq!(file.general.git_concurrency, 1);
+        assert_eq!(file.general.normal_exit_action, NormalExitAction::Exit);
+        assert_eq!(file.general.crash_exit_action, CrashExitAction::Exit);
     }
 
     #[test]
@@ -335,5 +449,28 @@ mod tests {
         assert_eq!(normalize_git_concurrency(0), 1);
         assert_eq!(normalize_git_concurrency(1), 1);
         assert_eq!(normalize_git_concurrency(MAX_GIT_CONCURRENCY + 10), 32);
+    }
+
+    #[test]
+    fn legacy_crash_restart_true_migrates_to_auto_restart() {
+        let text = "[general]\ncrash_auto_restart = true\n";
+        let mut file: LauncherFile = toml::from_str(text).expect("legacy config should parse");
+        migrate_legacy_exit_action(text, &mut file);
+        assert_eq!(file.general.crash_exit_action, CrashExitAction::AutoRestart);
+        assert!(!toml::to_string(&file)
+            .expect("migrated config should serialize")
+            .contains("crash_auto_restart"));
+    }
+
+    #[test]
+    fn explicit_crash_action_wins_over_legacy_toggle() {
+        let text =
+            "[general]\ncrash_auto_restart = true\ncrash_exit_action = 'return_to_launcher'\n";
+        let mut file: LauncherFile = toml::from_str(text).expect("mixed config should parse");
+        migrate_legacy_exit_action(text, &mut file);
+        assert_eq!(
+            file.general.crash_exit_action,
+            CrashExitAction::ReturnToLauncher
+        );
     }
 }

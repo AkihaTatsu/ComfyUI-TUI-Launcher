@@ -675,7 +675,7 @@ impl InstallTab {
 fn install_request(
     url: String,
     dest: PathBuf,
-    _root: PathBuf,
+    root: PathBuf,
     env_vars: std::collections::HashMap<String, String>,
     python: String,
 ) -> TaskRequest {
@@ -686,6 +686,7 @@ fn install_request(
         is_refresh: false,
         changes_repository: true,
         repository_access: RepositoryAccess::Exclusive,
+        ext_scan_root: None,
         work: Box::new(move |tx| {
             super::warn_if_storage_low(&tx, &dest);
             if !git::clone(&url, &dest, env_vars.clone()).unwrap_or(false) {
@@ -696,14 +697,13 @@ fn install_request(
                 );
             }
             let mut failures = Vec::new();
-            if !python.is_empty()
-                && !pip::install_requirements(std::path::Path::new(&python), &dest, env_vars)
-                    .unwrap_or(false)
+            if let Err(error) =
+                pip::install_custom_node(std::path::Path::new(&python), &root, &dest, env_vars)
             {
                 failures.push(super::ItemFailure::new(
                     &url,
-                    "pip install",
-                    "extension was cloned, but dependency installation failed; see the task log",
+                    error.stage.label(),
+                    error.detail("extension was cloned, but post-install processing failed"),
                 ));
             }
             if let Some(ext) = super::extensions_tab::read_one_local(&dest) {
@@ -733,6 +733,7 @@ pub fn fetch_registry_request(env_vars: std::collections::HashMap<String, String
         is_refresh: true,
         changes_repository: false,
         repository_access: RepositoryAccess::None,
+        ext_scan_root: None,
         work: Box::new(move |tx| {
             match extension_registry::fetch_blocking(&env_vars) {
                 Ok(entries) => {

@@ -88,17 +88,40 @@ type = "custom"
 cli = ""
 default = ""
 
-# ── Crash auto-restart (launcher-side; see core::process supervisor) ──
-# These never reach the ComfyUI command line. The toggle gates the feature;
-# the three numeric fields only take effect when the toggle is on.
+# ── ComfyUI process lifecycle (launcher-side) ──
+# These never reach the ComfyUI command line. Each final process outcome has
+# an independent action. The numeric fields only apply to automatic restarts.
 
 [[tab.field]]
-key = "general.crash_auto_restart"
-name = "setting_crash_auto_restart"
-desc = "setting_crash_auto_restart_desc"
-type = "toggle"
+key = "general.normal_exit_action"
+name = "setting_normal_exit_action"
+desc = "setting_normal_exit_action_desc"
+type = "choice"
 cli = ""
-default = false
+default = "exit"
+[[tab.field.option]]
+value = "exit"
+label = "exit_action_exit"
+[[tab.field.option]]
+value = "return_to_launcher"
+label = "exit_action_return_to_launcher"
+
+[[tab.field]]
+key = "general.crash_exit_action"
+name = "setting_crash_exit_action"
+desc = "setting_crash_exit_action_desc"
+type = "choice"
+cli = ""
+default = "exit"
+[[tab.field.option]]
+value = "exit"
+label = "exit_action_exit"
+[[tab.field.option]]
+value = "return_to_launcher"
+label = "exit_action_return_to_launcher"
+[[tab.field.option]]
+value = "auto_restart"
+label = "exit_action_auto_restart"
 
 [[tab.field]]
 key = "general.crash_restart_delay_secs"

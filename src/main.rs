@@ -45,9 +45,7 @@ fn install_panic_hook() {
 fn main() -> Result<()> {
     install_panic_hook();
 
-    let cfg = crate::core::config::Config::load_or_init()?;
-    crate::core::i18n::init(&cfg.general.language);
-    let (schema, _) = crate::core::schema::load_or_init()?;
+    let mut app = load_app()?;
 
     // Open the on-disk session log under the launcher's logs dir so every
     // subsequent `log_bus::push` is mirrored to a file that outlives the
@@ -85,30 +83,63 @@ fn main() -> Result<()> {
         std::process::exit(2);
     }
 
-    let mut app = crate::app::App::new(cfg, schema);
+    loop {
+        run_tui_session(&mut app)?;
 
+        if let Some(venv) = app.should_activate.clone() {
+            crate::core::process::activate_env_and_exit(&venv);
+        }
+        if app.should_launch {
+            app = match app.do_launch() {
+                crate::app::LaunchOutcome::ReturnToLauncher => load_app()?,
+                crate::app::LaunchOutcome::Exit(code) => std::process::exit(code),
+            };
+            continue;
+        }
+        return Ok(());
+    }
+}
+
+/// Loads a fresh launcher model. This is also used after ComfyUI exits so the
+/// returned TUI starts on the main screen without stale popups or task state.
+fn load_app() -> Result<crate::app::App> {
+    let cfg = crate::core::config::Config::load_or_init()?;
+    crate::core::i18n::init(&cfg.general.language);
+    let (schema, _) = crate::core::schema::load_or_init()?;
+    Ok(crate::app::App::new(cfg, schema))
+}
+
+/// Runs one alternate-screen TUI session and restores the terminal before any
+/// child process inherits it.
+fn run_tui_session(app: &mut crate::app::App) -> Result<()> {
     enable_raw_mode()?;
-    execute!(
+    if let Err(error) = execute!(
         stdout(),
         EnterAlternateScreen,
         EnableMouseCapture,
         SetTitle(crate::core::i18n::t("app_title")),
-    )?;
+    ) {
+        let _ = disable_raw_mode();
+        return Err(error.into());
+    }
+
     let backend = CrosstermBackend::new(stdout());
-    let mut term = Terminal::new(backend)?;
+    let mut term = match Terminal::new(backend) {
+        Ok(term) => term,
+        Err(error) => {
+            let _ = disable_raw_mode();
+            let _ = execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture);
+            return Err(error.into());
+        }
+    };
+    let run_result = run_loop(&mut term, app);
+    let raw_result = disable_raw_mode();
+    let screen_result = execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture);
 
-    let result = run_loop(&mut term, &mut app);
-
-    disable_raw_mode()?;
-    execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
-
-    if let Some(venv) = app.should_activate.clone() {
-        crate::core::process::activate_env_and_exit(&venv);
-    }
-    if app.should_launch {
-        app.do_launch();
-    }
-    result
+    run_result?;
+    raw_result?;
+    screen_result?;
+    Ok(())
 }
 
 fn run_loop(

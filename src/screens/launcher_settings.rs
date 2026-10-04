@@ -1,7 +1,7 @@
 //! Launcher general-preferences editor screen.
 
 use super::settings_view::SettingsView;
-use crate::core::config::Config;
+use crate::core::config::{Config, CrashExitAction, NormalExitAction};
 use crate::core::paths::ComfyDirs;
 use crate::core::schema::{self, Schema};
 use crate::core::{i18n, python};
@@ -78,7 +78,12 @@ fn get(cfg: &Config, key: &str) -> Value {
         "network.hf_mirror" => Value::String(cfg.network.hf_mirror.clone()),
         "network.hf_force_mirror" => Value::Boolean(cfg.network.hf_force_mirror),
         "network.github_accel" => Value::String(cfg.network.github_accel.clone()),
-        "general.crash_auto_restart" => Value::Boolean(cfg.general.crash_auto_restart),
+        "general.normal_exit_action" => {
+            Value::String(cfg.general.normal_exit_action.as_str().to_string())
+        }
+        "general.crash_exit_action" => {
+            Value::String(cfg.general.crash_exit_action.as_str().to_string())
+        }
         "general.crash_restart_delay_secs" => {
             Value::String(cfg.general.crash_restart_delay_secs.to_string())
         }
@@ -172,9 +177,16 @@ fn set(cfg: &mut Config, key: &str, v: Value) -> Result<(), String> {
             let _ = cfg.save();
             Ok(())
         }
-        "general.crash_auto_restart" => {
-            if let Some(b) = v.as_bool() {
-                cfg.general.crash_auto_restart = b;
+        "general.normal_exit_action" => {
+            if let Some(action) = v.as_str().and_then(NormalExitAction::parse) {
+                cfg.general.normal_exit_action = action;
+                let _ = cfg.save();
+            }
+            Ok(())
+        }
+        "general.crash_exit_action" => {
+            if let Some(action) = v.as_str().and_then(CrashExitAction::parse) {
+                cfg.general.crash_exit_action = action;
                 let _ = cfg.save();
             }
             Ok(())
