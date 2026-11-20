@@ -49,6 +49,22 @@ cli = ""
 default = "1"
 
 [[tab.field]]
+key = "general.git_retry_count"
+name = "setting_git_retry_count"
+desc = "setting_git_retry_count_desc"
+type = "custom"
+cli = ""
+default = "3"
+
+[[tab.field]]
+key = "general.git_retry_delay_secs"
+name = "setting_git_retry_delay"
+desc = "setting_git_retry_delay_desc"
+type = "custom"
+cli = ""
+default = "5"
+
+[[tab.field]]
 key = "network.pypi_mirror"
 name = "setting_pypi_mirror"
 desc = "setting_pypi_mirror_desc"

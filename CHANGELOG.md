@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added configurable Git retry counts and delays for version-management
+  operations, defaulting to three retries with a five-second delay, with
+  localized settings and retry logs in Simplified Chinese and US/UK English.
 - Added ComfyUI-Manager-compatible custom-node post-install handling: node
   dependencies and `install.py` now run after installs, updates, reinstalls,
   and version changes, with the installed Manager preferred and a built-in

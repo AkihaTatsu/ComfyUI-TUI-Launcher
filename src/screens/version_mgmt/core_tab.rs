@@ -297,6 +297,7 @@ impl CoreTab {
                     c.short,
                     env::build(&cfg.network),
                     cfg.general.python.clone(),
+                    git::RetryPolicy::from(&cfg.general),
                 ))
             }
             CoreFilter::Stable => {
@@ -306,6 +307,7 @@ impl CoreTab {
                     t.tag,
                     env::build(&cfg.network),
                     cfg.general.python.clone(),
+                    git::RetryPolicy::from(&cfg.general),
                 ))
             }
         }
@@ -425,6 +427,7 @@ impl CoreTab {
                         root,
                         env::build(&cfg.network),
                         new_limit,
+                        git::RetryPolicy::from(&cfg.general),
                     ));
                 }
                 if code == KeyCode::Up {
@@ -439,11 +442,13 @@ impl CoreTab {
                 root,
                 env::build(&cfg.network),
                 self.limit,
+                git::RetryPolicy::from(&cfg.general),
             )),
             KeyCode::Char('u') | KeyCode::Char('U') => Some(pull_request(
                 root.clone(),
                 env::build(&cfg.network),
                 cfg.general.python.clone(),
+                git::RetryPolicy::from(&cfg.general),
             )),
             KeyCode::Enter => {
                 let filtered = match self.filter {
@@ -459,6 +464,7 @@ impl CoreTab {
                                 c.short.clone(),
                                 env::build(&cfg.network),
                                 cfg.general.python.clone(),
+                                git::RetryPolicy::from(&cfg.general),
                             ));
                         }
                         CoreFilter::Stable => {
@@ -468,6 +474,7 @@ impl CoreTab {
                                 t.tag.clone(),
                                 env::build(&cfg.network),
                                 cfg.general.python.clone(),
+                                git::RetryPolicy::from(&cfg.general),
                             ));
                         }
                     }
@@ -693,6 +700,7 @@ pub fn load_request_with_env(
     root: PathBuf,
     env_vars: std::collections::HashMap<String, String>,
     limit: usize,
+    retry: git::RetryPolicy,
 ) -> TaskRequest {
     TaskRequest {
         title: i18n::t("task_core_load"),
@@ -706,8 +714,8 @@ pub fn load_request_with_env(
             // Fetch first so HEAD/remote refs are current, then deepen if the
             // repo is a shallow clone — otherwise `git log` would silently
             // stop at the shallow boundary and the user could never page past it.
-            let fetch_result = git::fetch_with_recovery(&root, env_vars.clone());
-            let deepen_ok = fetch_result.is_ok() && git::deepen_until_full(&root, env_vars);
+            let fetch_result = git::fetch_with_recovery(&root, env_vars.clone(), retry);
+            let deepen_ok = fetch_result.is_ok() && git::deepen_until_full(&root, env_vars, retry);
             let current = git::current_commit(&root);
             let branch = git::current_branch(&root);
             let remote = git::remote_url(&root);
@@ -750,11 +758,13 @@ pub fn local_load_request(
     root: PathBuf,
     env_vars: std::collections::HashMap<String, String>,
     limit: usize,
+    retry: git::RetryPolicy,
 ) -> TaskRequest {
     let then = TaskKind::CoreLoad {
         root: root.clone(),
         env: env_vars,
         limit,
+        retry,
     };
     TaskRequest {
         title: i18n::t("task_core_load"),
@@ -784,11 +794,13 @@ fn pull_request(
     root: PathBuf,
     env_vars: std::collections::HashMap<String, String>,
     python: String,
+    retry: git::RetryPolicy,
 ) -> TaskRequest {
     let then = TaskKind::CoreLoad {
         root: root.clone(),
         env: env_vars.clone(),
         limit: super::LIST_MAX_NUM,
+        retry,
     };
     TaskRequest {
         title: i18n::t("task_core_pull"),
@@ -802,7 +814,7 @@ fn pull_request(
             // Same fetch+reset strategy as extensions: works for detached
             // HEAD (from prior Change Version) and discards local edits to
             // tracked files (untracked files are kept).
-            if let Err(error) = git::sync_to_upstream(&root, env_vars.clone()) {
+            if let Err(error) = git::sync_to_upstream(&root, env_vars.clone(), retry) {
                 return super::TaskOutcome::failure("ComfyUI", "git sync", error.to_string());
             }
 
@@ -832,6 +844,7 @@ fn checkout_request(
     rev: String,
     env_vars: std::collections::HashMap<String, String>,
     python: String,
+    retry: git::RetryPolicy,
 ) -> TaskRequest {
     let title = i18n::t_args("task_core_checkout", &[("rev", &rev)]);
     TaskRequest {
@@ -846,7 +859,7 @@ fn checkout_request(
         ext_scan_root: None,
         work: Box::new(move |tx| {
             super::warn_if_storage_low(&tx, &root);
-            let checkout_ok = git::checkout(&root, &rev, env_vars.clone()).unwrap_or(false);
+            let checkout_ok = git::checkout(&root, &rev, env_vars.clone(), retry).unwrap_or(false);
             if !checkout_ok {
                 return super::TaskOutcome::failure(
                     "ComfyUI",
@@ -899,5 +912,105 @@ mod tests {
 
         tab.on_key(KeyCode::PageDown, &Config::default());
         assert_eq!((tab.grid.row(), tab.grid.list_selected()), (1, 2));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn checkout_retries_before_installing_dependencies_once() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        let root = std::env::temp_dir().join(format!(
+            "comfyui-checkout-retry-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("requirements.txt"), "").unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.name", "Launcher Test"],
+            vec!["config", "user.email", "launcher@example.invalid"],
+            vec!["add", "requirements.txt"],
+            vec!["commit", "-m", "initial"],
+        ] {
+            let output = Command::new("git")
+                .current_dir(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let hook = root.join(".git/hooks/post-checkout");
+        std::fs::write(
+            &hook,
+            r#"#!/bin/sh
+count=0
+if [ -f checkout-attempts ]; then read -r count < checkout-attempts; fi
+count=$((count + 1))
+printf '%s\n' "$count" > checkout-attempts
+[ "$count" -gt 1 ]
+"#,
+        )
+        .unwrap();
+        let python = root.join("test-python");
+        std::fs::write(
+            &python,
+            r#"#!/bin/sh
+printf 'installed\n' >> "$RETRY_TEST_PIP_TRACE"
+"#,
+        )
+        .unwrap();
+        for executable in [&hook, &python] {
+            std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let pip_trace = root.join("pip-trace");
+        let env = std::collections::HashMap::from([(
+            "RETRY_TEST_PIP_TRACE".into(),
+            pip_trace.display().to_string(),
+        )]);
+        let retry = git::RetryPolicy {
+            count: 1,
+            delay_secs: 0,
+        };
+        let request = checkout_request(
+            root.clone(),
+            "HEAD".into(),
+            env.clone(),
+            python.display().to_string(),
+            retry,
+        );
+        let (tx, _rx) = std::sync::mpsc::channel();
+        assert!(matches!(
+            (request.work)(tx),
+            super::super::TaskOutcome::Success
+        ));
+        assert_eq!(
+            std::fs::read_to_string(root.join("checkout-attempts"))
+                .unwrap()
+                .trim(),
+            "2"
+        );
+        assert_eq!(std::fs::read_to_string(&pip_trace).unwrap(), "installed\n");
+
+        let request = checkout_request(
+            root.clone(),
+            "missing-revision".into(),
+            env,
+            python.display().to_string(),
+            retry,
+        );
+        let (tx, _rx) = std::sync::mpsc::channel();
+        assert!(matches!(
+            (request.work)(tx),
+            super::super::TaskOutcome::Failure(_)
+        ));
+        assert_eq!(std::fs::read_to_string(&pip_trace).unwrap(), "installed\n");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

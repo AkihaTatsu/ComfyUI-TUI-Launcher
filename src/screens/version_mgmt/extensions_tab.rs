@@ -268,6 +268,7 @@ impl ExtensionsTab {
                 env_vars,
                 python,
                 cfg.general.git_concurrency,
+                git::RetryPolicy::from(&cfg.general),
             ));
         }
         None
@@ -286,6 +287,7 @@ impl ExtensionsTab {
             env::build(&cfg.network),
             cfg.general.python.clone(),
             cfg.general.git_concurrency,
+            git::RetryPolicy::from(&cfg.general),
         ))
     }
 
@@ -610,6 +612,7 @@ impl ExtensionsTab {
                             root,
                             env::build(&cfg.network),
                             cfg.general.python.clone(),
+                            git::RetryPolicy::from(&cfg.general),
                         ));
                     }
                 }
@@ -835,6 +838,7 @@ impl ExtensionsTab {
                             name,
                             env::build(&cfg.network),
                             limit,
+                            git::RetryPolicy::from(&cfg.general),
                         ));
                     }
                     vp.selected -= 1;
@@ -855,6 +859,7 @@ impl ExtensionsTab {
                                 name,
                                 env::build(&cfg.network),
                                 new_limit,
+                                git::RetryPolicy::from(&cfg.general),
                             ));
                         }
                         vp.selected = 0;
@@ -890,6 +895,7 @@ impl ExtensionsTab {
                             root,
                             env::build(&cfg.network),
                             cfg.general.python.clone(),
+                            git::RetryPolicy::from(&cfg.general),
                         ));
                     }
                     return None;
@@ -1025,6 +1031,7 @@ impl ExtensionsTab {
                         env_vars,
                         python,
                         cfg.general.git_concurrency,
+                        git::RetryPolicy::from(&cfg.general),
                     ));
                 }
                 _ => return None,
@@ -1062,6 +1069,7 @@ impl ExtensionsTab {
                             new_limit,
                             env::build(&cfg.network),
                             cfg.general.git_concurrency,
+                            git::RetryPolicy::from(&cfg.general),
                         ));
                     }
                     self.grid.move_down();
@@ -1079,6 +1087,7 @@ impl ExtensionsTab {
                     limit,
                     env::build(&cfg.network),
                     cfg.general.git_concurrency,
+                    git::RetryPolicy::from(&cfg.general),
                 ))
             }
             KeyCode::Char('d') | KeyCode::Char('D') => {
@@ -1118,6 +1127,7 @@ impl ExtensionsTab {
                     root,
                     env::build(&cfg.network),
                     cfg.general.python.clone(),
+                    git::RetryPolicy::from(&cfg.general),
                 ))
             }),
             _ => None,
@@ -1143,6 +1153,7 @@ impl ExtensionsTab {
                     root,
                     env::build(&cfg.network),
                     cfg.general.python.clone(),
+                    git::RetryPolicy::from(&cfg.general),
                 ))
             }
             "btn_change_version" => {
@@ -1163,6 +1174,7 @@ impl ExtensionsTab {
                     am.ext_name,
                     env::build(&cfg.network),
                     LIST_MAX_NUM,
+                    git::RetryPolicy::from(&cfg.general),
                 ))
             }
             "btn_open_url" => {
@@ -1299,6 +1311,7 @@ pub fn load_request_with_limit(
     limit: usize,
     env_vars: std::collections::HashMap<String, String>,
     git_concurrency: usize,
+    retry: git::RetryPolicy,
 ) -> TaskRequest {
     TaskRequest {
         title: i18n::t("task_ext_load"),
@@ -1373,7 +1386,7 @@ pub fn load_request_with_limit(
                 handles.push(std::thread::spawn(move || {
                     for (p, logical, disabled, managed) in mine {
                         let fetch_failure = if managed {
-                            git::fetch_with_recovery(&p, env.clone())
+                            git::fetch_with_recovery(&p, env.clone(), retry)
                                 .err()
                                 .map(|error| {
                                     super::ItemFailure::new(
@@ -1464,12 +1477,14 @@ pub fn local_load_request(
     limit: usize,
     env_vars: std::collections::HashMap<String, String>,
     git_concurrency: usize,
+    retry: git::RetryPolicy,
 ) -> TaskRequest {
     let then = TaskKind::ExtLoad {
         root: root.clone(),
         env: env_vars,
         limit,
         git_concurrency,
+        retry,
     };
     TaskRequest {
         title: i18n::t("task_ext_load"),
@@ -1503,6 +1518,7 @@ pub(super) fn update_one_request(
     root: PathBuf,
     env_vars: std::collections::HashMap<String, String>,
     python: String,
+    retry: git::RetryPolicy,
 ) -> TaskRequest {
     let title = i18n::t_args("task_ext_update_one", &[("name", &name)]);
     TaskRequest {
@@ -1514,7 +1530,7 @@ pub(super) fn update_one_request(
         ext_scan_root: None,
         work: Box::new(move |tx| {
             super::warn_if_storage_low(&tx, &path);
-            if let Err(e) = git::sync_to_upstream(&path, env_vars.clone()) {
+            if let Err(e) = git::sync_to_upstream(&path, env_vars.clone(), retry) {
                 return super::TaskOutcome::failure(name, "git sync", e.to_string());
             }
             let mut failures = Vec::new();
@@ -1567,15 +1583,16 @@ fn update_all_request(
     env_vars: std::collections::HashMap<String, String>,
     python: String,
     git_concurrency: usize,
+    retry: git::RetryPolicy,
 ) -> TaskRequest {
     bulk_sync_request(
-        i18n::t("task_ext_update_all"),
         BulkMode::UpdateOutdated,
         items,
         root,
         env_vars,
         python,
         git_concurrency,
+        retry,
     )
 }
 
@@ -1583,14 +1600,18 @@ fn update_all_request(
 /// strictly one repository at a time because every pip command mutates the
 /// same Python environment.
 fn bulk_sync_request(
-    title: String,
     mode: BulkMode,
     items: Vec<Extension>,
     root: PathBuf,
     env_vars: std::collections::HashMap<String, String>,
     python: String,
     git_concurrency: usize,
+    retry: git::RetryPolicy,
 ) -> TaskRequest {
+    let title = i18n::t(match mode {
+        BulkMode::UpdateOutdated => "task_ext_update_all",
+        BulkMode::ReinstallAll => "task_ext_reinstall_all",
+    });
     let then = match mode {
         BulkMode::UpdateOutdated => TaskKind::None,
         BulkMode::ReinstallAll => TaskKind::ExtLoad {
@@ -1598,6 +1619,7 @@ fn bulk_sync_request(
             env: env_vars.clone(),
             limit: super::LIST_MAX_NUM,
             git_concurrency,
+            retry,
         },
     };
     TaskRequest {
@@ -1628,7 +1650,7 @@ fn bulk_sync_request(
                 let result_tx = result_tx.clone();
                 handles.push(std::thread::spawn(move || {
                     for ext in entries {
-                        let result = git::sync_to_upstream(&ext.path, env.clone())
+                        let result = git::sync_to_upstream(&ext.path, env.clone(), retry)
                             .map_err(|e| e.to_string());
                         let _ = result_tx.send((ext, result));
                     }
@@ -1724,6 +1746,7 @@ fn list_versions_request_n(
     name: String,
     env_vars: std::collections::HashMap<String, String>,
     limit: usize,
+    retry: git::RetryPolicy,
 ) -> TaskRequest {
     let title = i18n::t_args("task_ext_versions", &[("name", &name)]);
     TaskRequest {
@@ -1735,8 +1758,8 @@ fn list_versions_request_n(
         ext_scan_root: None,
         work: Box::new(move |tx| {
             super::warn_if_storage_low(&tx, &path);
-            let fetch_result = git::fetch_with_recovery(&path, env_vars.clone());
-            let deepen_ok = fetch_result.is_ok() && git::deepen_until_full(&path, env_vars);
+            let fetch_result = git::fetch_with_recovery(&path, env_vars.clone(), retry);
+            let deepen_ok = fetch_result.is_ok() && git::deepen_until_full(&path, env_vars, retry);
             let commits = git::log_all(&path, limit).unwrap_or_default();
             let current = git::current_commit(&path);
             let _ = tx.send(TaskResult::ExtCommits {
@@ -1771,6 +1794,7 @@ fn checkout_ext_request(
     root: PathBuf,
     env_vars: std::collections::HashMap<String, String>,
     python: String,
+    retry: git::RetryPolicy,
 ) -> TaskRequest {
     let title = i18n::t_args("task_ext_checkout", &[("name", &name), ("rev", &rev)]);
     TaskRequest {
@@ -1782,7 +1806,7 @@ fn checkout_ext_request(
         ext_scan_root: None,
         work: Box::new(move |tx| {
             super::warn_if_storage_low(&tx, &path);
-            if !git::checkout(&path, &rev, env_vars.clone()).unwrap_or(false) {
+            if !git::checkout(&path, &rev, env_vars.clone(), retry).unwrap_or(false) {
                 return super::TaskOutcome::failure(
                     &name,
                     "git checkout",
@@ -1927,15 +1951,16 @@ fn reinstall_all_request(
     env_vars: std::collections::HashMap<String, String>,
     python: String,
     git_concurrency: usize,
+    retry: git::RetryPolicy,
 ) -> TaskRequest {
     bulk_sync_request(
-        i18n::t("task_ext_reinstall_all"),
         BulkMode::ReinstallAll,
         items,
         root,
         env_vars,
         python,
         git_concurrency,
+        retry,
     )
 }
 
@@ -2000,6 +2025,10 @@ mod tests {
             Default::default(),
             String::new(),
             4,
+            git::RetryPolicy {
+                count: 0,
+                delay_secs: 0,
+            },
         );
         assert!(matches!(request.then, TaskKind::None));
     }
@@ -2098,7 +2127,16 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        let request = load_request_with_limit(root.clone(), 10, Default::default(), 1);
+        let request = load_request_with_limit(
+            root.clone(),
+            10,
+            Default::default(),
+            1,
+            git::RetryPolicy {
+                count: 0,
+                delay_secs: 0,
+            },
+        );
         let (tx, rx) = std::sync::mpsc::channel();
         let outcome = (request.work)(tx);
         assert!(matches!(outcome, super::super::TaskOutcome::Success));

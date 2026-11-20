@@ -73,6 +73,10 @@ fn get(cfg: &Config, key: &str) -> Value {
         "general.comfyui_dir" => Value::String(cfg.general.comfyui_dir.clone()),
         "general.python" => Value::String(cfg.general.python.clone()),
         "general.git_concurrency" => Value::String(cfg.general.git_concurrency.to_string()),
+        "general.git_retry_count" => Value::String(cfg.general.git_retry_count.to_string()),
+        "general.git_retry_delay_secs" => {
+            Value::String(cfg.general.git_retry_delay_secs.to_string())
+        }
         "network.pypi_mirror" => Value::String(cfg.network.pypi_mirror.clone()),
         "network.git_mirror" => Value::String(cfg.network.git_mirror.clone()),
         "network.hf_mirror" => Value::String(cfg.network.hf_mirror.clone()),
@@ -143,6 +147,16 @@ fn set(cfg: &mut Config, key: &str, v: Value) -> Result<(), String> {
             let _ = cfg.save();
             Ok(())
         }
+        "general.git_retry_count" => {
+            cfg.general.git_retry_count = parse_count(&v, 0)?;
+            let _ = cfg.save();
+            Ok(())
+        }
+        "general.git_retry_delay_secs" => {
+            cfg.general.git_retry_delay_secs = parse_count(&v, 0)?;
+            let _ = cfg.save();
+            Ok(())
+        }
         // Mirror fields: canonicalise the semicolon-separated list to the
         // tight `a;b;c` form so the on-disk file is consistent regardless
         // of the user's input style.
@@ -210,5 +224,25 @@ fn set(cfg: &mut Config, key: &str, v: Value) -> Result<(), String> {
             Ok(())
         }
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_inputs_accept_non_negative_integers_and_reject_invalid_values() {
+        for (text, expected) in [("0", 0), (" 7 ", 7), ("11", 11)] {
+            assert_eq!(parse_count(&Value::String(text.into()), 0), Ok(expected));
+        }
+        for key in ["general.git_retry_count", "general.git_retry_delay_secs"] {
+            for text in ["", "-1", "1.5", "abc", "18446744073709551616"] {
+                let mut cfg = Config::default();
+                let before = get(&cfg, key);
+                assert!(set(&mut cfg, key, Value::String(text.into())).is_err());
+                assert_eq!(get(&cfg, key), before);
+            }
+        }
     }
 }

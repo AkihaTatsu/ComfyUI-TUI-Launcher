@@ -584,7 +584,14 @@ impl InstallTab {
         let python = cfg.general.python.clone();
         self.url.value.clear();
         self.url.cursor = 0;
-        Some(install_request(url, dest, root, env_vars, python))
+        Some(install_request(
+            url,
+            dest,
+            root,
+            env_vars,
+            python,
+            git::RetryPolicy::from(&cfg.general),
+        ))
     }
 
     /// Open the per-row Actions popup for the currently-selected catalog
@@ -634,7 +641,12 @@ impl InstallTab {
                 let env_vars = env::build(&cfg.network);
                 let python = cfg.general.python.clone();
                 Some(super::extensions_tab::update_one_request(
-                    path, name, root, env_vars, python,
+                    path,
+                    name,
+                    root,
+                    env_vars,
+                    python,
+                    git::RetryPolicy::from(&cfg.general),
                 ))
             }
             "btn_install" => {
@@ -650,7 +662,14 @@ impl InstallTab {
                 let dest = dest_dir.join(&name);
                 let env_vars = env::build(&cfg.network);
                 let python = cfg.general.python.clone();
-                Some(install_request(url, dest, root, env_vars, python))
+                Some(install_request(
+                    url,
+                    dest,
+                    root,
+                    env_vars,
+                    python,
+                    git::RetryPolicy::from(&cfg.general),
+                ))
             }
             "btn_open_url" => {
                 if !opener::open_url(&am.entry.reference) {
@@ -678,6 +697,7 @@ fn install_request(
     root: PathBuf,
     env_vars: std::collections::HashMap<String, String>,
     python: String,
+    retry: git::RetryPolicy,
 ) -> TaskRequest {
     let title = i18n::t_args("task_install", &[("url", &url)]);
     TaskRequest {
@@ -689,7 +709,7 @@ fn install_request(
         ext_scan_root: None,
         work: Box::new(move |tx| {
             super::warn_if_storage_low(&tx, &dest);
-            if !git::clone(&url, &dest, env_vars.clone()).unwrap_or(false) {
+            if !git::clone(&url, &dest, env_vars.clone(), retry).unwrap_or(false) {
                 return super::TaskOutcome::failure(
                     &url,
                     "git clone",

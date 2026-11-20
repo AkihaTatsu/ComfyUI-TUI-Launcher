@@ -70,6 +70,53 @@ use anyhow::Result;
 use std::path::Path;
 use std::process::Command;
 
+/// Per-command retry settings captured when a version-management task is created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryPolicy {
+    /// Additional attempts after the first failure.
+    pub count: u64,
+    /// Fixed delay before each retry, in seconds.
+    pub delay_secs: u64,
+}
+
+impl From<&crate::core::config::General> for RetryPolicy {
+    fn from(general: &crate::core::config::General) -> Self {
+        Self {
+            count: general.git_retry_count,
+            delay_secs: general.git_retry_delay_secs,
+        }
+    }
+}
+
+impl RetryPolicy {
+    fn run(self, target: &Path, mut operation: impl FnMut() -> Result<bool>) -> Result<bool> {
+        let mut retries = 0;
+        loop {
+            let result = operation();
+            if let Err(error) = &result {
+                crate::core::log_bus::push("git", error.to_string());
+            }
+            if matches!(result, Ok(true)) || retries == self.count {
+                return result;
+            }
+            retries += 1;
+            crate::core::log_bus::push(
+                "git",
+                crate::core::i18n::t_args(
+                    "git_retry_notice",
+                    &[
+                        ("target", &target.display().to_string()),
+                        ("delay", &self.delay_secs.to_string()),
+                        ("n", &retries.to_string()),
+                        ("max", &self.count.to_string()),
+                    ],
+                ),
+            );
+            std::thread::sleep(std::time::Duration::from_secs(self.delay_secs));
+        }
+    }
+}
+
 /// One commit produced by `git log`.
 #[derive(Debug, Clone)]
 pub struct Commit {
@@ -214,16 +261,22 @@ pub fn remote_url(repo: &Path) -> Option<String> {
 }
 
 /// Runs `git fetch --all` with non-interactive safeguards applied.
-pub fn fetch(repo: &Path, env: std::collections::HashMap<String, String>) -> Result<bool> {
-    run_logged(
-        "git",
-        Cmd::new("git")
-            .arg("-C")
-            .arg(repo.display().to_string())
-            .arg("fetch")
-            .arg("--all")
-            .envs(no_prompt_env(env)),
-    )
+pub fn fetch(
+    repo: &Path,
+    env: std::collections::HashMap<String, String>,
+    retry: RetryPolicy,
+) -> Result<bool> {
+    retry.run(repo, || {
+        run_logged(
+            "git",
+            Cmd::new("git")
+                .arg("-C")
+                .arg(repo.display().to_string())
+                .arg("fetch")
+                .arg("--all")
+                .envs(no_prompt_env(env.clone())),
+        )
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -302,20 +355,30 @@ fn fsck_connectivity(repo: &Path, env: HashMap<String, String>) -> Result<bool> 
 /// Fetches all configured remotes without object negotiation, asking the
 /// remote to resend reachable objects even when local refs already advertise
 /// them. This is the non-destructive recovery path for missing Git objects.
-pub fn force_refetch(repo: &Path, env: HashMap<String, String>) -> Result<bool> {
-    run_logged(
-        "git",
-        Cmd::new("git")
-            .arg("-C")
-            .arg(repo.display().to_string())
-            .arg("fetch")
-            .arg("--all")
-            .arg("--refetch")
-            .envs(no_prompt_env(env)),
-    )
+pub fn force_refetch(
+    repo: &Path,
+    env: HashMap<String, String>,
+    retry: RetryPolicy,
+) -> Result<bool> {
+    retry.run(repo, || {
+        run_logged(
+            "git",
+            Cmd::new("git")
+                .arg("-C")
+                .arg(repo.display().to_string())
+                .arg("fetch")
+                .arg("--all")
+                .arg("--refetch")
+                .envs(no_prompt_env(env.clone())),
+        )
+    })
 }
 
-fn recover_missing_objects(repo: &Path, env: &HashMap<String, String>) -> Result<()> {
+fn recover_missing_objects(
+    repo: &Path,
+    env: &HashMap<String, String>,
+    retry: RetryPolicy,
+) -> Result<()> {
     crate::core::log_bus::push(
         "git",
         format!(
@@ -323,7 +386,7 @@ fn recover_missing_objects(repo: &Path, env: &HashMap<String, String>) -> Result
             repo.display()
         ),
     );
-    if !force_refetch(repo, env.clone())? {
+    if !force_refetch(repo, env.clone(), retry)? {
         anyhow::bail!(
             "repository is corrupt and forced refetch failed (or this Git version does not support --refetch); upgrade Git or reinstall the repository"
         );
@@ -347,15 +410,19 @@ fn recover_missing_objects(repo: &Path, env: &HashMap<String, String>) -> Result
 /// Fetches normally, then repairs a confirmed missing-object condition once.
 /// A clean connectivity check means the fetch failed for some other reason,
 /// so no high-write-volume refetch is attempted.
-pub fn fetch_with_recovery(repo: &Path, env: HashMap<String, String>) -> Result<()> {
-    if fetch(repo, env.clone())? {
+pub fn fetch_with_recovery(
+    repo: &Path,
+    env: HashMap<String, String>,
+    retry: RetryPolicy,
+) -> Result<()> {
+    if fetch(repo, env.clone(), retry)? {
         return Ok(());
     }
     match connectivity_status(repo, env.clone())? {
         ConnectivityStatus::Intact => anyhow::bail!(
             "git fetch failed, but repository connectivity is intact; see the task log"
         ),
-        ConnectivityStatus::MissingOrCorrupt => recover_missing_objects(repo, &env),
+        ConnectivityStatus::MissingOrCorrupt => recover_missing_objects(repo, &env, retry),
         ConnectivityStatus::Indeterminate(detail) => anyhow::bail!(
             "git fetch failed and repository corruption could not be confirmed: {detail}"
         ),
@@ -383,36 +450,44 @@ pub fn is_shallow(repo: &Path) -> bool {
 /// (some mirrors silently refuse `--unshallow`), falls back to a fetch
 /// with a very large `--depth`. Returns whether the repository ended up
 /// non-shallow.
-pub fn deepen_until_full(repo: &Path, env: std::collections::HashMap<String, String>) -> bool {
+pub fn deepen_until_full(
+    repo: &Path,
+    env: std::collections::HashMap<String, String>,
+    retry: RetryPolicy,
+) -> bool {
     if !is_shallow(repo) {
         return true;
     }
     let env = no_prompt_env(env);
     crate::core::log_bus::push("git", "deepening shallow clone (fetch --unshallow)…");
-    let _ = run_logged(
-        "git",
-        Cmd::new("git")
-            .arg("-C")
-            .arg(repo.display().to_string())
-            .arg("fetch")
-            .arg("--unshallow")
-            .arg("--tags")
-            .envs(env.clone()),
-    );
+    let _ = retry.run(repo, || {
+        run_logged(
+            "git",
+            Cmd::new("git")
+                .arg("-C")
+                .arg(repo.display().to_string())
+                .arg("fetch")
+                .arg("--unshallow")
+                .arg("--tags")
+                .envs(env.clone()),
+        )
+    });
     if !is_shallow(repo) {
         return true;
     }
     crate::core::log_bus::push("git", "still shallow — retrying with --depth=2147483647");
-    let _ = run_logged(
-        "git",
-        Cmd::new("git")
-            .arg("-C")
-            .arg(repo.display().to_string())
-            .arg("fetch")
-            .arg("--depth=2147483647")
-            .arg("--tags")
-            .envs(env),
-    );
+    let _ = retry.run(repo, || {
+        run_logged(
+            "git",
+            Cmd::new("git")
+                .arg("-C")
+                .arg(repo.display().to_string())
+                .arg("fetch")
+                .arg("--depth=2147483647")
+                .arg("--tags")
+                .envs(env.clone()),
+        )
+    });
     !is_shallow(repo)
 }
 
@@ -426,32 +501,26 @@ pub fn checkout(
     repo: &Path,
     rev: &str,
     env: std::collections::HashMap<String, String>,
+    retry: RetryPolicy,
 ) -> Result<bool> {
-    let ok = run_logged(
-        "git",
-        Cmd::new("git")
-            .arg("-C")
-            .arg(repo.display().to_string())
-            .arg("checkout")
-            .arg("--force")
-            .arg(rev.to_string())
-            .envs(safe_directory_env(env.clone())),
-    )?;
+    let ok = retry.run(repo, || {
+        run_logged(
+            "git",
+            Cmd::new("git")
+                .arg("-C")
+                .arg(repo.display().to_string())
+                .arg("checkout")
+                .arg("--force")
+                .arg(rev.to_string())
+                .envs(safe_directory_env(env.clone())),
+        )
+    })?;
     if !ok {
         // Hard-reset to the requested commit. Handles edge cases where
         // `checkout --force` refuses (for example dirty index entries that
         // cannot be discarded by a plain checkout).
         crate::core::log_bus::push("git", "checkout --force failed; trying reset --hard");
-        return run_logged(
-            "git",
-            Cmd::new("git")
-                .arg("-C")
-                .arg(repo.display().to_string())
-                .arg("reset")
-                .arg("--hard")
-                .arg(rev.to_string())
-                .envs(safe_directory_env(env)),
-        );
+        return reset_hard(repo, rev, env, retry);
     }
     Ok(true)
 }
@@ -464,27 +533,34 @@ pub fn reset_hard(
     repo: &Path,
     rev: &str,
     env: std::collections::HashMap<String, String>,
+    retry: RetryPolicy,
 ) -> Result<bool> {
-    run_logged(
-        "git",
-        Cmd::new("git")
-            .arg("-C")
-            .arg(repo.display().to_string())
-            .arg("reset")
-            .arg("--hard")
-            .arg(rev.to_string())
-            .envs(safe_directory_env(env)),
-    )
+    retry.run(repo, || {
+        run_logged(
+            "git",
+            Cmd::new("git")
+                .arg("-C")
+                .arg(repo.display().to_string())
+                .arg("reset")
+                .arg("--hard")
+                .arg(rev.to_string())
+                .envs(safe_directory_env(env.clone())),
+        )
+    })
 }
 
-fn reset_to_available_upstream(repo: &Path, env: &HashMap<String, String>) -> Result<bool> {
+fn reset_to_available_upstream(
+    repo: &Path,
+    env: &HashMap<String, String>,
+    retry: RetryPolicy,
+) -> Result<bool> {
     let targets: &[&str] = if current_branch(repo).is_some() {
         &["@{u}", "origin/HEAD", "FETCH_HEAD"]
     } else {
         &["origin/HEAD", "FETCH_HEAD"]
     };
     for target in targets {
-        if reset_hard(repo, target, env.clone())? {
+        if reset_hard(repo, target, env.clone(), retry)? {
             return Ok(true);
         }
     }
@@ -494,9 +570,13 @@ fn reset_to_available_upstream(repo: &Path, env: &HashMap<String, String>) -> Re
 /// Brings a repository to its available upstream HEAD and performs one
 /// non-destructive object refetch when a connectivity check proves the local
 /// object database is incomplete.
-pub fn sync_to_upstream(repo: &Path, env: HashMap<String, String>) -> Result<()> {
-    fetch_with_recovery(repo, env.clone())?;
-    if reset_to_available_upstream(repo, &env)? {
+pub fn sync_to_upstream(
+    repo: &Path,
+    env: HashMap<String, String>,
+    retry: RetryPolicy,
+) -> Result<()> {
+    fetch_with_recovery(repo, env.clone(), retry)?;
+    if reset_to_available_upstream(repo, &env, retry)? {
         return Ok(());
     }
 
@@ -507,12 +587,12 @@ pub fn sync_to_upstream(repo: &Path, env: HashMap<String, String>) -> Result<()>
         ConnectivityStatus::Intact => {
             anyhow::bail!("no upstream target could be reset; repository connectivity is intact")
         }
-        ConnectivityStatus::MissingOrCorrupt => recover_missing_objects(repo, &env)?,
+        ConnectivityStatus::MissingOrCorrupt => recover_missing_objects(repo, &env, retry)?,
         ConnectivityStatus::Indeterminate(detail) => anyhow::bail!(
             "upstream reset failed and repository corruption could not be confirmed: {detail}"
         ),
     }
-    if reset_to_available_upstream(repo, &env)? {
+    if reset_to_available_upstream(repo, &env, retry)? {
         Ok(())
     } else {
         anyhow::bail!("repository was recovered, but no upstream target could be reset")
@@ -524,15 +604,18 @@ pub fn clone(
     url: &str,
     dest: &Path,
     env: std::collections::HashMap<String, String>,
+    retry: RetryPolicy,
 ) -> Result<bool> {
-    run_logged(
-        "git",
-        Cmd::new("git")
-            .arg("clone")
-            .arg(url.to_string())
-            .arg(dest.display().to_string())
-            .envs(no_prompt_env(env)),
-    )
+    retry.run(dest, || {
+        run_logged(
+            "git",
+            Cmd::new("git")
+                .arg("clone")
+                .arg(url.to_string())
+                .arg(dest.display().to_string())
+                .envs(no_prompt_env(env.clone())),
+        )
+    })
 }
 
 /// One release tag together with the commit it points at.
@@ -694,6 +777,103 @@ mod runtime_config_tests {
     }
 
     #[test]
+    fn retries_stop_on_success_and_respect_the_additional_attempt_budget() {
+        for (count, failures, expected_attempts, success) in [
+            (3, 0, 1, true),
+            (3, 2, 3, true),
+            (3, 3, 4, true),
+            (3, 4, 4, false),
+            (0, 1, 1, false),
+        ] {
+            let mut attempts = 0;
+            let result = RetryPolicy {
+                count,
+                delay_secs: 0,
+            }
+            .run(Path::new("retry-budget-test"), || {
+                attempts += 1;
+                Ok(attempts > failures)
+            })
+            .unwrap();
+            assert_eq!(result, success);
+            assert_eq!(attempts, expected_attempts);
+        }
+    }
+
+    #[test]
+    fn execution_errors_are_retried_and_the_final_error_is_preserved() {
+        let retry = RetryPolicy {
+            count: 2,
+            delay_secs: 0,
+        };
+        let mut attempts = 0;
+        assert!(retry
+            .run(Path::new("retry-error-success-test"), || {
+                attempts += 1;
+                if attempts < 3 {
+                    anyhow::bail!("temporary execution failure");
+                }
+                Ok(true)
+            })
+            .unwrap());
+        assert_eq!(attempts, 3);
+
+        attempts = 0;
+        let error = retry
+            .run(Path::new("retry-final-error-test"), || {
+                attempts += 1;
+                anyhow::bail!("execution failure {attempts}");
+            })
+            .unwrap_err();
+        assert_eq!(attempts, 3);
+        assert_eq!(error.to_string(), "execution failure 3");
+    }
+
+    #[test]
+    fn each_retry_waits_for_the_configured_interval() {
+        use std::time::{Duration, Instant};
+        let mut starts = Vec::new();
+        assert!(RetryPolicy {
+            count: 2,
+            delay_secs: 1
+        }
+        .run(Path::new("retry-delay-test"), || {
+            starts.push(Instant::now());
+            Ok(starts.len() == 3)
+        })
+        .unwrap());
+        for pair in starts.windows(2) {
+            assert!(pair[1].duration_since(pair[0]) >= Duration::from_secs(1));
+        }
+    }
+
+    #[test]
+    fn retry_policy_captures_settings_for_the_task() {
+        let mut general = crate::core::config::General {
+            git_retry_count: 7,
+            git_retry_delay_secs: 11,
+            ..Default::default()
+        };
+        let retry = RetryPolicy::from(&general);
+        general.git_retry_count = 0;
+        general.git_retry_delay_secs = 0;
+        assert_eq!(
+            retry,
+            RetryPolicy {
+                count: 7,
+                delay_secs: 11
+            }
+        );
+        assert_eq!(
+            RetryPolicy::from(&general),
+            RetryPolicy {
+                count: 0,
+                delay_secs: 0
+            }
+        );
+    }
+
+    #[test]
     fn safe_directory_is_appended_after_mirror_rules() {
         let mut env = HashMap::new();
         env.insert("GIT_CONFIG_COUNT".into(), "2".into());
@@ -717,6 +897,150 @@ mod runtime_config_tests {
             Some("safe.directory")
         );
         assert_eq!(got.get("GIT_CONFIG_VALUE_2").map(String::as_str), Some("*"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_commands_retry_with_the_same_environment_and_keep_fallback_order() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "comfyui-git-retry-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bin = root.join("bin");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+        git_stdout(&repo, ["init", "-b", "main"]);
+        git_stdout(&repo, ["config", "user.name", "Launcher Test"]);
+        git_stdout(&repo, ["config", "user.email", "launcher@example.invalid"]);
+        std::fs::write(repo.join("file.txt"), "original").unwrap();
+        git_stdout(&repo, ["add", "file.txt"]);
+        git_stdout(&repo, ["commit", "-m", "initial"]);
+        let real_git = Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap();
+        assert!(real_git.status.success());
+        let wrapper = bin.join("git");
+        std::fs::write(
+            &wrapper,
+            r#"#!/bin/sh
+[ "$GIT_CONFIG_COUNT" = 2 ] || exit 90
+[ "$GIT_CONFIG_KEY_0" = url.https://mirror.invalid/.insteadOf ] || exit 91
+[ "$GIT_CONFIG_KEY_1" = safe.directory ] || exit 92
+count=0
+if [ -f "$RETRY_TEST_COUNTER" ]; then read -r count < "$RETRY_TEST_COUNTER"; fi
+count=$((count + 1))
+printf '%s\n' "$count" > "$RETRY_TEST_COUNTER"
+printf '%s\n' "$*" >> "$RETRY_TEST_TRACE"
+if [ "$count" -le "$RETRY_TEST_FAILURES" ]; then exit 1; fi
+exec "$RETRY_TEST_GIT" "$@"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let counter = root.join("counter");
+        let trace = root.join("trace");
+        let mut path = vec![bin];
+        path.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+        let mut env = HashMap::from([
+            (
+                "PATH".into(),
+                std::env::join_paths(path)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            (
+                "RETRY_TEST_GIT".into(),
+                String::from_utf8(real_git.stdout).unwrap().trim().into(),
+            ),
+            ("RETRY_TEST_COUNTER".into(), counter.display().to_string()),
+            ("RETRY_TEST_TRACE".into(), trace.display().to_string()),
+            ("RETRY_TEST_FAILURES".into(), "1".into()),
+            ("GIT_CONFIG_COUNT".into(), "1".into()),
+            (
+                "GIT_CONFIG_KEY_0".into(),
+                "url.https://mirror.invalid/.insteadOf".into(),
+            ),
+            (
+                "GIT_CONFIG_VALUE_0".into(),
+                "https://unused.invalid/".into(),
+            ),
+        ]);
+        let retry = RetryPolicy {
+            count: 1,
+            delay_secs: 0,
+        };
+        for operation in ["fetch", "refetch", "checkout", "reset", "clone"] {
+            std::fs::write(&counter, "0\n").unwrap();
+            std::fs::write(&trace, "").unwrap();
+            let result = match operation {
+                "fetch" => fetch(&repo, env.clone(), retry),
+                "refetch" => force_refetch(&repo, env.clone(), retry),
+                "checkout" => checkout(&repo, "HEAD", env.clone(), retry),
+                "reset" => reset_hard(&repo, "HEAD", env.clone(), retry),
+                "clone" => clone(
+                    repo.to_str().unwrap(),
+                    &root.join("clone"),
+                    env.clone(),
+                    retry,
+                ),
+                _ => unreachable!(),
+            };
+            assert!(result.unwrap(), "{operation} should succeed on retry");
+            assert_eq!(std::fs::read_to_string(&counter).unwrap().trim(), "2");
+            let trace = std::fs::read_to_string(&trace).unwrap();
+            let lines: Vec<_> = trace.lines().collect();
+            assert_eq!(lines[0], lines[1], "retry must repeat the same command");
+        }
+        let shallow = root.join("shallow");
+        git_stdout(
+            &root,
+            [
+                "clone",
+                "--depth=1",
+                &format!("file://{}", repo.display()),
+                shallow.to_str().unwrap(),
+            ],
+        );
+        assert!(is_shallow(&shallow));
+        std::fs::write(&counter, "0\n").unwrap();
+        assert!(deepen_until_full(&shallow, env.clone(), retry));
+        assert!(!is_shallow(&shallow));
+        assert_eq!(std::fs::read_to_string(&counter).unwrap().trim(), "2");
+
+        std::fs::write(&counter, "0\n").unwrap();
+        std::fs::write(&trace, "").unwrap();
+        sync_to_upstream(&root.join("clone"), env.clone(), retry).unwrap();
+        let sync_trace = std::fs::read_to_string(&trace).unwrap();
+        let sync_lines: Vec<_> = sync_trace.lines().collect();
+        assert_eq!(sync_lines.len(), 3);
+        assert!(sync_lines[..2]
+            .iter()
+            .all(|line| line.contains(" fetch --all")));
+        assert!(sync_lines[2].contains(" reset --hard @{u}"));
+
+        // Both checkout attempts must finish before the existing reset fallback.
+        env.insert("RETRY_TEST_FAILURES".into(), "10".into());
+        std::fs::write(&counter, "0\n").unwrap();
+        std::fs::write(&trace, "").unwrap();
+        assert!(!checkout(&repo, "HEAD", env, retry).unwrap());
+        let trace = std::fs::read_to_string(&trace).unwrap();
+        let lines: Vec<_> = trace.lines().collect();
+        assert_eq!(lines.len(), 4);
+        assert!(lines[..2]
+            .iter()
+            .all(|line| line.contains(" checkout --force HEAD")));
+        assert!(lines[2..]
+            .iter()
+            .all(|line| line.contains(" reset --hard HEAD")));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -769,7 +1093,15 @@ mod runtime_config_tests {
         std::fs::remove_file(source.join("tracked.txt")).unwrap();
         assert!(!fsck_connectivity(&source, HashMap::new()).unwrap());
 
-        sync_to_upstream(&source, HashMap::new()).expect("forced refetch should recover object");
+        sync_to_upstream(
+            &source,
+            HashMap::new(),
+            RetryPolicy {
+                count: 2,
+                delay_secs: 0,
+            },
+        )
+        .expect("forced refetch should recover object");
 
         assert_eq!(
             std::fs::read_to_string(source.join("tracked.txt")).unwrap(),

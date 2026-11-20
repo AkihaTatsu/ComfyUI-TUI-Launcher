@@ -112,6 +112,11 @@ mod tests {
             for key in [
                 "setting_git_concurrency",
                 "setting_git_concurrency_desc",
+                "setting_git_retry_count",
+                "setting_git_retry_count_desc",
+                "setting_git_retry_delay",
+                "setting_git_retry_delay_desc",
+                "git_retry_notice",
                 "task_waiting_repository",
                 "task_progress",
                 "task_title_with_detail",
@@ -123,6 +128,29 @@ mod tests {
                 assert!(
                     catalogue.contains_key(key),
                     "locale {code} is missing {key}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn git_retry_translations_are_complete_and_preserve_placeholders() {
+        for (code, text) in LOCALES {
+            let catalogue: HashMap<String, String> = toml::from_str(text).unwrap();
+            for key in [
+                "setting_git_retry_count",
+                "setting_git_retry_count_desc",
+                "setting_git_retry_delay",
+                "setting_git_retry_delay_desc",
+            ] {
+                assert!(!catalogue[key].trim().is_empty(), "locale {code}: {key}");
+            }
+            let notice = &catalogue["git_retry_notice"];
+            for placeholder in ["{target}", "{delay}", "{n}", "{max}"] {
+                assert_eq!(
+                    notice.matches(placeholder).count(),
+                    1,
+                    "locale {code}: {placeholder}"
                 );
             }
         }

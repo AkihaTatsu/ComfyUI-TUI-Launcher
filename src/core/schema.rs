@@ -177,6 +177,31 @@ mod launcher_schema_tests {
     }
 
     #[test]
+    fn git_retry_fields_follow_concurrency_and_match_config_defaults() {
+        let schema = load_launcher_or_init().unwrap();
+        let fields: Vec<_> = schema.tabs.iter().flat_map(|tab| &tab.fields).collect();
+        let index = fields
+            .iter()
+            .position(|field| field.key == "general.git_concurrency")
+            .unwrap();
+        let defaults = crate::core::config::General::default();
+        for (offset, key, value) in [
+            (1, "general.git_retry_count", defaults.git_retry_count),
+            (
+                2,
+                "general.git_retry_delay_secs",
+                defaults.git_retry_delay_secs,
+            ),
+        ] {
+            let field = fields[index + offset];
+            assert_eq!(field.key, key);
+            assert_eq!(field.default.as_str().unwrap(), value.to_string());
+            assert!(matches!(field.ty, FieldType::Custom));
+            assert!(field.cli.is_empty());
+        }
+    }
+
+    #[test]
     fn launcher_schema_contains_exit_action_choices() {
         let schema = load_launcher_or_init().expect("embedded launcher schema should parse");
         let find = |key: &str| {

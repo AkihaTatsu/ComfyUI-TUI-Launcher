@@ -122,6 +122,12 @@ pub struct General {
     /// extension scans and bulk operations.
     #[serde(default = "default_git_concurrency")]
     pub git_concurrency: usize,
+    /// Additional attempts after a Git execution fails; zero disables retries.
+    #[serde(default = "default_git_retry_count")]
+    pub git_retry_count: u64,
+    /// Fixed delay in seconds before each additional Git attempt.
+    #[serde(default = "default_git_retry_delay_secs")]
+    pub git_retry_delay_secs: u64,
     /// Action taken after a clean exit or an intentional stop such as Ctrl+C.
     #[serde(default)]
     pub normal_exit_action: NormalExitAction,
@@ -154,6 +160,12 @@ fn default_mode() -> String {
 fn default_git_concurrency() -> usize {
     1
 }
+fn default_git_retry_count() -> u64 {
+    3
+}
+fn default_git_retry_delay_secs() -> u64 {
+    5
+}
 
 /// Applies the supported range to persisted or programmatically supplied
 /// concurrency values.
@@ -181,6 +193,8 @@ impl Default for General {
             language: default_lang(),
             mode: default_mode(),
             git_concurrency: default_git_concurrency(),
+            git_retry_count: default_git_retry_count(),
+            git_retry_delay_secs: default_git_retry_delay_secs(),
             normal_exit_action: NormalExitAction::default(),
             crash_exit_action: CrashExitAction::default(),
             crash_restart_delay_secs: default_restart_delay(),
@@ -442,6 +456,28 @@ mod tests {
         assert_eq!(file.general.git_concurrency, 1);
         assert_eq!(file.general.normal_exit_action, NormalExitAction::Exit);
         assert_eq!(file.general.crash_exit_action, CrashExitAction::Exit);
+    }
+
+    #[test]
+    fn git_retry_defaults_match_legacy_and_fresh_configs() {
+        let legacy: LauncherFile = toml::from_str("[general]\nmode = 'advanced'\n").unwrap();
+        for general in [legacy.general, General::default()] {
+            assert_eq!(general.git_retry_count, 3);
+            assert_eq!(general.git_retry_delay_secs, 5);
+        }
+    }
+
+    #[test]
+    fn git_retry_settings_round_trip_including_zero() {
+        for (count, delay) in [(0, 0), (7, 11)] {
+            let mut file = LauncherFile::default();
+            file.general.git_retry_count = count;
+            file.general.git_retry_delay_secs = delay;
+            let stored = toml::to_string(&file).unwrap();
+            let loaded: LauncherFile = toml::from_str(&stored).unwrap();
+            assert_eq!(loaded.general.git_retry_count, count);
+            assert_eq!(loaded.general.git_retry_delay_secs, delay);
+        }
     }
 
     #[test]

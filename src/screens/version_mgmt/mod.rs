@@ -11,7 +11,7 @@ pub mod extensions_tab;
 pub mod install_tab;
 
 use crate::core::config::Config;
-use crate::core::{i18n, log_bus, theme};
+use crate::core::{git, i18n, log_bus, theme};
 use crate::widgets::log_display::{
     LogBusSource, LogDisplay, LogDisplayOptions, LogRange, LogViewportMode,
 };
@@ -79,6 +79,7 @@ pub enum TaskKind {
         root: PathBuf,
         env: std::collections::HashMap<String, String>,
         limit: usize,
+        retry: git::RetryPolicy,
     },
     /// Reload the extensions list from the given ComfyUI root.
     ExtLoad {
@@ -86,6 +87,7 @@ pub enum TaskKind {
         env: std::collections::HashMap<String, String>,
         limit: usize,
         git_concurrency: usize,
+        retry: git::RetryPolicy,
     },
 }
 
@@ -507,7 +509,12 @@ impl VersionMgmt {
                     if self.core_requested_for.as_deref() != Some(&root) {
                         self.core_requested_for = Some(root.clone());
                         let env_vars = crate::core::env::build(&cfg.network);
-                        self.spawn_auto(core_tab::local_load_request(root, env_vars, LIST_MAX_NUM));
+                        self.spawn_auto(core_tab::local_load_request(
+                            root,
+                            env_vars,
+                            LIST_MAX_NUM,
+                            git::RetryPolicy::from(&cfg.general),
+                        ));
                         changed = true;
                     }
                 }
@@ -520,6 +527,7 @@ impl VersionMgmt {
                             LIST_MAX_NUM,
                             env_vars,
                             cfg.general.git_concurrency,
+                            git::RetryPolicy::from(&cfg.general),
                         ));
                         changed = true;
                     }
@@ -533,6 +541,7 @@ impl VersionMgmt {
                             LIST_MAX_NUM,
                             env_vars,
                             cfg.general.git_concurrency,
+                            git::RetryPolicy::from(&cfg.general),
                         ));
                         changed = true;
                     }
@@ -876,20 +885,27 @@ impl VersionMgmt {
         // `behind` and unmerged-upstream rows.
         match kind {
             TaskKind::None => {}
-            TaskKind::CoreLoad { root, env, limit } => {
-                self.spawn_auto(core_tab::load_request_with_env(root, env, limit));
+            TaskKind::CoreLoad {
+                root,
+                env,
+                limit,
+                retry,
+            } => {
+                self.spawn_auto(core_tab::load_request_with_env(root, env, limit, retry));
             }
             TaskKind::ExtLoad {
                 root,
                 env,
                 limit,
                 git_concurrency,
+                retry,
             } => {
                 self.spawn_auto(extensions_tab::load_request_with_limit(
                     root,
                     limit,
                     env,
                     git_concurrency,
+                    retry,
                 ));
             }
         }
@@ -1260,6 +1276,29 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn remote_refresh_follow_ups_keep_the_tasks_retry_policy() {
+        let retry = git::RetryPolicy {
+            count: 7,
+            delay_secs: 11,
+        };
+        let core =
+            core_tab::local_load_request(PathBuf::new(), Default::default(), LIST_MAX_NUM, retry);
+        let ext = extensions_tab::local_load_request(
+            PathBuf::new(),
+            LIST_MAX_NUM,
+            Default::default(),
+            4,
+            retry,
+        );
+        assert!(
+            matches!(core.then, TaskKind::CoreLoad { retry: captured, .. } if captured == retry)
+        );
+        assert!(
+            matches!(ext.then, TaskKind::ExtLoad { retry: captured, git_concurrency: 4, .. } if captured == retry)
+        );
+    }
 
     #[test]
     fn task_titles_compose_status_name_and_optional_detail_in_each_language() {
