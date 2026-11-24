@@ -17,6 +17,7 @@ btn_activate_env       = "激活 Python 环境"
 popup_activate_failed_title = "激活环境"
 popup_activate_no_python    = "尚未配置 Python 解释器。"
 popup_activate_not_venv     = "当前 Python 不在虚拟环境中，无法激活。"
+activate_shell_failed      = "启动或等待环境终端失败：{error}"
 
 section_comfy_info     = "ComfyUI 信息"
 section_directories    = "目录"

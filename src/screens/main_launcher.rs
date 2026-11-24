@@ -670,3 +670,24 @@ fn shell_quote(s: &str) -> String {
     let escaped = s.replace('\'', "'\\''");
     format!("'{escaped}'")
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// Runs in a separate process under scripts/test-environment-activation.py.
+    #[test]
+    #[ignore = "requires an isolated interactive terminal and test virtualenv"]
+    fn environment_activation_integration_probe() {
+        let mut cfg = Config::default();
+        cfg.general.python = std::env::var("COMFYUI_ACTIVATION_TEST_PYTHON").unwrap();
+        i18n::init(&std::env::var("COMFYUI_ACTIVATION_TEST_LANGUAGE").unwrap());
+        match MainLauncher::new().activate_venv(&cfg) {
+            MainAction::ActivateVenv(root) => {
+                crate::core::process::activate_env_and_exit(&root);
+            }
+            MainAction::QuitAlreadyActivated => println!("ENVIRONMENT_ALREADY_ACTIVE"),
+            _ => panic!("expected environment activation or already-active action"),
+        }
+    }
+}

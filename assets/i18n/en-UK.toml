@@ -17,6 +17,7 @@ btn_activate_env       = "Activate Python Environment"
 popup_activate_failed_title = "Activate Environment"
 popup_activate_no_python    = "No Python interpreter is configured."
 popup_activate_not_venv     = "The configured Python is not inside a virtualenv, so it cannot be activated."
+activate_shell_failed      = "Failed to start or wait for the environment shell: {error}"
 
 section_comfy_info     = "ComfyUI Information"
 section_directories    = "Directories"

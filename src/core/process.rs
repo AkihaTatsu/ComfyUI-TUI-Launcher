@@ -167,13 +167,13 @@ fn push_pending_line(source: &str, key: &str, pending: &[u8], had_progress: bool
     }
 }
 
-/// Replaces this process with an interactive shell whose environment has
-/// the given virtualenv activated.
+/// Opens an interactive shell with the given virtualenv activated.
 ///
 /// `VIRTUAL_ENV` is set to the venv root, `PATH` is prepended with the
 /// venv's `bin` or `Scripts` directory, and `PYTHONHOME` is cleared. On
-/// Unix the launcher `execvp`s into `$SHELL`; on Windows a new `%COMSPEC%`
-/// process inherits the parent console. Does not return on success.
+/// Unix the launcher waits for `$SHELL`, keeping its identity available to
+/// session restorers, then exits with the shell's status. On Windows a new
+/// `%COMSPEC%` process inherits the parent console. Does not return.
 pub fn activate_env_and_exit(venv_root: &Path) -> ! {
     use std::ffi::OsString;
     let bin = if cfg!(windows) { "Scripts" } else { "bin" };
@@ -187,15 +187,30 @@ pub fn activate_env_and_exit(venv_root: &Path) -> ! {
 
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt;
+        use std::os::unix::process::ExitStatusExt;
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
         let mut cmd = Command::new(&shell);
         cmd.env("VIRTUAL_ENV", venv_root)
             .env("PATH", &new_path)
             .env_remove("PYTHONHOME");
-        let err = cmd.exec();
-        eprintln!("exec shell failed: {err}");
-        std::process::exit(1);
+        match cmd.status() {
+            Ok(status) => {
+                let code = status
+                    .code()
+                    .unwrap_or_else(|| 128 + status.signal().unwrap());
+                std::process::exit(code);
+            }
+            Err(error) => {
+                eprintln!(
+                    "{}",
+                    crate::core::i18n::t_args(
+                        "activate_shell_failed",
+                        &[("error", &error.to_string())],
+                    )
+                );
+                std::process::exit(1);
+            }
+        }
     }
 
     #[cfg(windows)]

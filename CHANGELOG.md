@@ -23,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or repair stage without retrying an `install.py` that may already have run.
 
 ### Fixed
+- On Unix, activating a Python environment now keeps the launcher running
+  until the environment shell exits, so session restorers can record the
+  launcher instead of the shell. Activating the same environment again exits
+  the nested launcher without opening another shell.
 - The launcher log page now returns to the newest entries whenever it is
   entered, follows new output at the bottom, and preserves a manually scrolled
   viewport until the user reaches the bottom again.
